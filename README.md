@@ -4,7 +4,7 @@ A Go framework for building HashiCorp Vault Transit–compatible API servers who
 
 The first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
 
-**Status: pre-release.** v1 is feature complete and tested against real Ceph RGW releases 18.2.8 (reef), 19.2.7 (squid), and 20.2.5 (tentacle), but nothing has been released yet and the API may still change.
+**Status: v0.x.** It is feature complete for Ceph RGW and tested against real RGW releases 18.2.8 (reef), 19.2.7 (squid), and 20.2.5 (tentacle). Until v1.0 the Go API may change between minor versions. What is bound into ciphertexts (the mount ID, the AAD and envelope formats) is not going to change.
 
 What it does:
 
@@ -24,6 +24,10 @@ Documents:
 - [examples/sakurakms](examples/sakurakms): the same for SAKURA Cloud KMS, a KMS without a parameter for authenticated data
 
 ## Usage
+
+```console
+$ go get github.com/fujiwara/transhim
+```
 
 transhim is a library. You implement `transhim.Backend` against your KMS and write your own `main`:
 
