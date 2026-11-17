@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.2 (M0 capture results applied; see [compat.md](compat.md))
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1 implemented)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -143,8 +143,9 @@ RustFS has a `vault-transit` KMS backend. The exact endpoint set is **unknown** 
 
 ```
 transhim/                 core (stdlib only)
-  server.go               Server, options, routing
+  server.go               Server, options, routing, handlers
   mount.go
+  auth.go                 Authorizer, AuthRequest
   backend.go              Backend interfaces & request/response types
   envelope.go             ciphertext encoding/decoding
   cache.go                decrypt cache
@@ -158,7 +159,7 @@ examples/
   gcpkms/                 separate go.mod (optional, later)
 ```
 
-Go version: latest stable Go at implementation time (1.27). Module path: `github.com/fujiwara/transhim`.
+Go version: the two latest stable Go releases (1.26 and 1.27 at implementation time). Module path: `github.com/fujiwara/transhim`.
 
 ---
 
@@ -175,7 +176,9 @@ General rules:
 - `X-Vault-Token` may appear more than once (RGW sends it twice with the same value). The first value is used.
 - **Key name** is everything after the operation segment. It is URL-unescaped once and treated as an **opaque string**. It must allow `.`, `-`, `_`, and `$` (RGW tenant user IDs). It is rejected if it is empty, contains `/`, or contains control characters.
 - Unknown paths under a mount return 404 and are logged at WARN, so that client API drift is noticed.
-- Request bodies are limited, with a default of 1 MiB (configurable).
+- Request bodies are limited, with a default of 1 MiB (configurable). A larger body is answered with 413.
+- Any method other than `POST` and `PUT` on a known operation is answered with 405, as Vault does.
+- Checks run in this order: route (404), method (405), key name (400), authorizer, body. A denied request never reaches the backend.
 
 ### 6.1 `POST {prefix}/datakey/plaintext/{name}`
 
@@ -278,6 +281,7 @@ Upstream error details go to logs and audit only, never into the response body.
 The external form is `vault:v{N}:{base64std(payload)}`.
 
 - `N` is the key version reported by the backend (default 1). Some clients parse it.
+- Only the canonical encoding is accepted on decrypt (strict base64, minimal varints, no trailing bytes), so a ciphertext has exactly one string form.
 - `payload` is transhim's binary envelope:
 
 ```
@@ -363,7 +367,7 @@ Backends never receive the mount prefix. `DataKeyRequest` likewise carries `Moun
 Server construction (functional options):
 
 ```go
-srv := transhim.NewServer(
+srv, err := transhim.NewServer(
     transhim.Mount("/v1/transit", "rgw-kms", backend), // prefix, mount ID (required), backend
     transhim.WithAuthorizer(fn),          // func(ctx, AuthRequest) error
     transhim.WithDecryptCache(cfg),
@@ -376,6 +380,10 @@ srv := transhim.NewServer(
 The mount ID is a positional argument of `Mount` rather than an option, so that omitting it is a compile error. `NewServer` validates it as described in §7.2.
 
 `AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
+
+The authorizer returns an error wrapping `ErrPermissionDenied` to answer 403. Any other error also rejects the request and is mapped as in §6.8. `transhim.StaticTokenAuthorizer(token)` is provided for the common single-token setup (constant-time comparison; an empty token allows nothing).
+
+`ErrUpstream` is a sentinel. `*UpstreamError{Err, Retryable}` matches it and selects 503 when `Retryable` is set.
 
 ### Hierarchical backend (`transhim/hierarchical`)
 
@@ -481,13 +489,15 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 ## 15. Milestones
 
 0. **M0 – Capture** (done): record the real requests of Ceph RGW (SSE-KMS and SSE-S3) against Vault or OpenBao, covering §12 items 1, 2, 4, and 6. These results determine the exact v1 endpoint set (see the v1 scope rule in §2), the API shape, the "key not found" response, and whether lazy key creation is needed, so they come before M1. Record them in `docs/compat.md`.
-1. **M1 – Core**: server, routing, envelope, AAD, error mapping, `datakey/plaintext`, `decrypt`, `encrypt`, authorizer, FakeBackend, unit tests.
+1. **M1 – Core** (done): server, routing, envelope, AAD, error mapping, `datakey/plaintext`, `decrypt`, `encrypt`, authorizer, FakeBackend, unit tests.
 2. **M2 – Key ops**: `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
 3. **M3 – Hierarchical backend** + memstore + tests.
 4. **M4 – RGW acceptance**: golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
 5. **M5 – Examples & docs**: AWS KMS example, RGW configuration guide, README.
 
 Not in v1 (see §3): token stubs, `sys/health`, `GET keys/{name}`, and §12 items 3 and 5.
+
+The pre-development stub `cmd/transhim` was removed in M1 (NG6); releases carry no binaries.
 
 Definition of done for each milestone: tests pass with `-race`, `go vet` and `staticcheck` are clean, and exported identifiers are documented.
 

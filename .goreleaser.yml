@@ -1,27 +1,9 @@
 version: 2
-before:
-  hooks:
-    - go mod download
+# transhim is a library: a release is a tag with a changelog, without binaries.
 builds:
-  - env:
-      - CGO_ENABLED=0
-    main: ./cmd/transhim/
-    binary: transhim
-    goos:
-      - linux
-      - darwin
-      - windows
-    goarch:
-      - amd64
-      - arm64
+  - skip: true
 release:
   use_existing_draft: true
-checksum:
-  name_template: "checksums.txt"
-archives:
-  - name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-snapshot:
-  version_template: "{{ .Tag }}-next"
 changelog:
   sort: asc
   filters:
