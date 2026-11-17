@@ -87,9 +87,20 @@ It wraps small blobs: data keys of 16 to 64 bytes for `datakey`, and up to the m
 
 `transhimtest.RunConformance` fails a backend that does not bind the AAD.
 
-### Do not trust `KeyRef` and `Version`
+### `KeyRef` and `Version`
 
-`WrappedKey.KeyRef` and `Version` come back on decrypt exactly as a client sent them; the server does not authenticate them. Decide which KMS key to use from `req.KeyName`, never from `KeyRef`, and reject a `Version` you would not have produced. Both examples return `ErrCiphertextMismatch` for any version other than 1.
+Both are part of the `WrappedKey` that `Encrypt` returns. The server puts them into the ciphertext string and hands them back on decrypt. **It does not authenticate them: a client can change them in a ciphertext.**
+
+- **`Version`** is the `N` of `vault:vN:...` and the `key_version` of the answer. It is there because the Vault format has it. Unless your backend keeps several generations of a key itself, it has no use: return `1`, and reject anything else on decrypt with `ErrCiphertextMismatch`. A KMS that rotates keys internally, like the two in the examples, needs no version here.
+- **`KeyRef`** is a free-form string: by convention the exact key that was used, such as a KMS key ARN. Reading it out of a ciphertext tells an operator which KMS key an object depends on, for example after an alias was moved. The examples record it and do not look at it on decrypt.
+
+Uses that change what decrypt does:
+
+- a backend that rotates keys itself selects the generation by `Version` or `KeyRef`;
+- a KMS that must be told the key or key version to decrypt with gets it from `KeyRef`;
+- a backend that changes how it builds the blob tells old from new by either.
+
+These are sound on one condition: the value only selects among the keys that `req.KeyName` may use anyway, and decrypting with the wrong one fails. Never take `KeyRef` as the KMS key to use as it is. That would let a client point the server at any key its credentials reach.
 
 ### Decide what a key name may reach
 
