@@ -4,7 +4,7 @@ A Go framework for building HashiCorp Vault Transit–compatible API servers who
 
 The first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
 
-**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. The hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) is implemented as well. Still missing: the acceptance test against a real RGW, and the AWS KMS example. The API may change until the first release.
+**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. The hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) is implemented as well. It is tested against real Ceph RGW releases 18.2.8 (reef), 19.2.7 (squid), and 20.2.5 (tentacle), for SSE-KMS and SSE-S3. Still missing: the AWS KMS example. The API may change until the first release.
 
 - [docs/DESIGN.md](docs/DESIGN.md): design document
 - [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, and how the reference implementation answers
@@ -45,6 +45,7 @@ Things to know:
 - A backend may also implement `DataKeyGenerator` if its KMS has a native "generate data key" call.
 - A backend may implement `KeyLifecycle` to create and delete keys when the client asks (Ceph RGW does, for SSE-S3: one key per bucket). Without it, those requests succeed and do nothing, and keys are expected to exist in the KMS.
 - `transhimtest.FakeBackend` is an in-memory backend for tests.
+- `transhimtest.RunConformance` checks a server built on your backend: it drives every endpoint the way Ceph RGW does, including the requests that must be rejected.
 
 ### Per-bucket keys: the hierarchical backend
 
@@ -89,9 +90,12 @@ It is off by default. It holds plaintext data keys in memory, so **the TTL is th
 The development environment follows [fujiwara/s3rp](https://github.com/fujiwara/s3rp): `compose.yml` runs Ceph RGW from the plain release image, bootstrapped by `docker/ceph-demo.sh`, plus OpenBao as the reference Transit implementation.
 
 ```console
-$ make test       # unit tests
-$ make capture    # re-capture RGW's Transit requests into testdata/capture/
+$ make test          # unit tests
+$ make integration   # acceptance test: starts Ceph RGW and runs SSE-KMS and SSE-S3 against transhim
+$ make capture       # re-capture RGW's Transit requests into testdata/capture/
 ```
+
+`make integration` needs docker compose. The test (in `integration/`, a Go module of its own because it uses the AWS SDK) starts a transhim server at `127.0.0.1:8201`, where the RGW of `compose.yml` expects its Transit endpoint. Another Ceph release: `CEPH_IMAGE=quay.io/ceph/ceph:v19.2.7 make integration`.
 
 `make capture` needs docker compose, curl, jq, and the aws CLI. See [compat/capture.sh](compat/capture.sh) for its options (`CEPH_IMAGE`, `EMPTY_KEY_WRITES`, `CEPH_EXTRA_ARGS`).
 

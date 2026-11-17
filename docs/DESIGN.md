@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1–M3 implemented)
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1–M4 implemented: v1 is accepted against Ceph 18.2.8, 19.2.7, and 20.2.5)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -464,7 +464,7 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 
 The design relies on assumptions taken from documentation and memory. The implementer must confirm each one and record the result in `docs/compat.md`. Items 3 and 5 concern non-RGW clients and are **deferred (D9)**; v1 requires items 1, 2, 4 (for RGW only), and 6.
 
-Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 18.2.8, 19.2.7, and 20.2.5 against OpenBao 2.7.2. The results are in [compat.md](compat.md), the raw captures in `testdata/capture/`, and they are reproducible with `compat/capture.sh`. Still open: how RGW reacts to 403, 5xx, and timeouts from the Transit endpoint (M4).
+Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 18.2.8, 19.2.7, and 20.2.5 against OpenBao 2.7.2. The results are in [compat.md](compat.md), the raw captures in `testdata/capture/`, and they are reproducible with `compat/capture.sh`. How RGW reacts to 403, 5xx, and a slow or unreachable Transit endpoint was added in M4.
 
 1. Capture the actual HTTP requests made by Ceph RGW (Reef and Squid, and the latest available release) for SSE-KMS and SSE-S3 with `secret_engine = transit`. Do this with a recording proxy in front of a real Vault or OpenBao. Confirm the exact paths, methods, body fields (`context`?), the expected status codes, and whether `keys/` is called before the first `datakey`.
 2. Confirm which `rgw_crypt_vault_secret_engine` compat value disables the legacy export path.
@@ -479,9 +479,10 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 
 - Unit tests for the envelope codec (round-trip, fuzzing with `testing.F`), AAD construction, key name validation, prefix normalization, and error mapping.
 - `transhimtest.FakeBackend`: AES-GCM with keys held in memory. It supports all optional interfaces and can inject errors and latency.
-- `transhimtest.RunConformance(t, http.Handler)`: drives every v1 endpoint (including `encrypt`) and every negative case. The negative cases are: wrong key name, wrong context, tampered ciphertext, missing auth, oversized plaintext, an `exportable` key create, and cache invalidation after delete.
+- `transhimtest.RunConformance(t, transhimtest.Conformance{Handler, Prefix, Token, ...})`: drives every v1 endpoint (including `encrypt`) and every negative case. The negative cases are: wrong key name, wrong context, tampered ciphertext, missing auth, oversized plaintext, an `exportable` key create, and cache invalidation after delete.
 - Concurrency tests run with `-race` (cache, hierarchical backend).
-- RGW integration test (build tag `integration`, not run by default; it is the v1 acceptance test, see M4): Ceph RGW in a container (for example the `quay.io/ceph/demo`-style image, or cephadm in CI if feasible) pointed at transhim with FakeBackend. It PUTs and GETs objects with SSE-KMS and SSE-S3, and verifies that bucket deletion triggers key deletion.
+- Golden fixtures (`transhimtest`, `TestFixtures`): the M0 captures are replayed against transhim, exchange by exchange. RGW's requests must get the recorded status and an answer of the recorded shape. For the direct probes of OpenBao, every deliberate difference is listed in the test with its reason; an unlisted difference fails.
+- RGW integration test (`integration/`, skipped unless `TRANSHIM_TEST_RGW_ENDPOINT` is set; it is the v1 acceptance test, see M4): Ceph RGW from `compose.yml`, as in fujiwara/s3rp, pointed at a transhim server that the test starts (FakeBackend for SSE-KMS, the hierarchical backend for SSE-S3). It PUTs and GETs objects with SSE-KMS and SSE-S3, with and without the decrypt cache, and verifies that bucket deletion deletes the bucket's key. It also injects failures of the Transit endpoint and checks that RGW fails closed. It is a Go module of its own, so that the AWS SDK it uses is not a dependency of transhim. CI runs it against the three Ceph releases.
 
 ## 14. Security Considerations
 
@@ -498,7 +499,7 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 1. **M1 – Core** (done): server, routing, envelope, AAD, error mapping, `datakey/plaintext`, `decrypt`, `encrypt`, authorizer, FakeBackend, unit tests.
 2. **M2 – Key ops** (done): `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
 3. **M3 – Hierarchical backend** (done) + memstore + tests.
-4. **M4 – RGW acceptance**: golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
+4. **M4 – RGW acceptance** (done): golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
 5. **M5 – Examples & docs**: AWS KMS example, RGW configuration guide, README.
 
 Not in v1 (see §3): token stubs, `sys/health`, `GET keys/{name}`, and §12 items 3 and 5.

@@ -25,3 +25,49 @@ jobs:
       - name: Build & Test
         run: |
           go test -race ./...
+
+  # The acceptance test: a real Ceph RGW doing SSE-KMS and SSE-S3 against
+  # transhim (integration/). The older releases are tested as well because
+  # they are the ones that need key writes answered without a body.
+  integration:
+    name: Integration (Ceph ${{ matrix.ceph }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the image pinned in compose.yml, which dependabot keeps current
+          - ceph: compose default
+            image: ""
+          - ceph: squid
+            image: quay.io/ceph/ceph:v19.2.7
+          - ceph: reef
+            image: quay.io/ceph/ceph:v18.2.8
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27"
+          cache-dependency-path: integration/go.sum
+
+      - name: Start Ceph RGW
+        run: |
+          docker compose up -d --wait ceph
+          docker compose exec -T ceph ceph --version
+        env:
+          CEPH_IMAGE: ${{ matrix.image }}
+
+      - name: Integration Test
+        working-directory: integration
+        run: |
+          go test -race -count=1 -v ./...
+        env:
+          TRANSHIM_TEST_RGW_ENDPOINT: http://127.0.0.1:7480
+
+      - name: Ceph logs
+        if: ${{ failure() }}
+        run: |
+          docker compose logs --tail 200 ceph

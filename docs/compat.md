@@ -49,7 +49,7 @@ Details that matter to an implementation:
 - **`bits`** is never sent; RGW relies on the 256-bit default.
 - **Response fields read.** `data.plaintext` and `data.ciphertext` from `datakey`, `data.plaintext` from `decrypt`. Nothing else is read (`key_version`, `request_id`, and the other envelope fields are ignored). Responses to `keys/...` calls are expected to be empty; see below.
 - **Key names.** For SSE-KMS it is the client's key ID, verbatim. RGW itself rejects a key ID containing `/` (400 `InvalidArgument`) without calling Vault, and rejects `aws:kms` without a key ID. For SSE-S3 it is `rgw_crypt_sse_s3_key_template` expanded; the default `%bucket_id` gives the bucket marker, e.g. `1434f035-2747-4d60-a14f-5a0efa651729.4126.2`. The template may also use `%owner_id`.
-- **Errors.** Any failed `datakey` or `decrypt` call reaches the S3 client as `400 InvalidArgument`, "Failed to retrieve the actual key, kms-keyid: ...". A missing key and any other failure look the same to the client.
+- **Errors.** A `datakey` or `decrypt` call answered with `400` reaches the S3 client as `400 InvalidArgument`, "Failed to retrieve the actual key, kms-keyid: ...". A missing key and a ciphertext that does not verify look the same to the client. Other statuses are passed on differently; see "How RGW reacts to a failing Transit endpoint".
 
 ### Is `keys/` called before the first `datakey`?
 
@@ -139,7 +139,30 @@ These are OpenBao's answers, recorded for the golden fixtures. Where transhim de
 - **Token file.** RGW reads the token from a file that group and others must not be able to access (reef, squid; tentacle allows up to `0740`). `docker/ceph-demo.sh` writes it as the `ceph` user for that reason.
 - **aws CLI.** aws-cli 2.36 crashes while printing an RGW error whose `<Message>` is empty (reef and squid send those). The capture script reads the status and error code from the wire instead.
 
+## How RGW reacts to a failing Transit endpoint
+
+Observed with the acceptance test (`integration/`, `TestRGWFaults` and `TestRGWEndpointDown`), which puts a fault in front of transhim for one kind of request at a time. The S3 operations are PutObject (fails in `datakey`) and GetObject (fails in `decrypt`) with SSE-KMS; both react the same way.
+
+| Transit endpoint answers | S3 client sees (tentacle, squid) | S3 client sees (reef) |
+|---|---|---|
+| `400` (missing key, invalid ciphertext) | `400 InvalidArgument` | `400 InvalidArgument` |
+| `403` | `403 AccessDenied` | `403 AccessDenied` |
+| `500` | `500 InternalError` | `500 UnknownError` |
+| `502` | `500 InternalError` | `500 UnknownError` |
+| `503` | `503 ServiceUnavailable` | `500 UnknownError` |
+| `200` without `data`, or not JSON | `400 InvalidArgument` | `400 InvalidArgument` |
+| connection reset, or nothing listening | `500 InternalError` | `500 UnknownError` |
+| answer after 3 s, or after 75 s | success | success |
+
+What follows from it:
+
+- **RGW fails closed.** In none of these cases was an object stored unencrypted or handed out. A PutObject whose `datakey` failed leaves no object behind.
+- **RGW does not retry**, and it sets no timeout that 75 seconds would reach: a slow key service makes S3 requests slow, not failed. Each waiting S3 request holds its RGW request thread meanwhile.
+- **`503` is worth sending.** transhim answers `503` for an `UpstreamError` marked `Retryable`. On squid and tentacle that reaches the S3 client as `503 ServiceUnavailable`, which S3 SDKs retry.
+- **A `403` is visible as such.** An authorizer that denies a key by name shows up as `403 AccessDenied` at the S3 client.
+- **SSE-S3 key operations.** If `POST keys/{name}` fails, the PutObject that needed the key fails (`500`) and stores nothing. If `config` or `DELETE` fail, DeleteBucket succeeds all the same and the key is orphaned, as described above.
+- Unencrypted objects are not affected by any of this.
+
 ## Not covered yet
 
-- How RGW reacts to `403`, `5xx`, timeouts, and malformed responses from the Transit endpoint. To be tested against transhim in M4, where such responses can be injected.
 - §12 items 3 and 5 (go-kms-wrapping, RustFS): deferred with their clients (DESIGN.md §3, D9).
