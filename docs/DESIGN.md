@@ -383,7 +383,7 @@ srv, err := transhim.NewServer(
 
 The mount ID is a positional argument of `Mount` rather than an option, so that omitting it is a compile error. `NewServer` validates it as described in §7.2.
 
-`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Context` (the decoded context of datakey, encrypt, and decrypt requests; the body is read before the authorizer runs, and body errors are reported after it), `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
+`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Context` (the decoded context of datakey, encrypt, and decrypt requests, nil if it is absent or empty; the body is read before the authorizer runs, within `WithBodyReadTimeout` (default 10 s, answered with 408), and body errors are reported after it), `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
 
 The authorizer returns an error wrapping `ErrPermissionDenied` to answer 403. Any other error also rejects the request and is mapped as in §6.8. `transhim.StaticTokenAuthorizer(token)` is provided for the common single-token setup (constant-time comparison; an empty token allows nothing).
 

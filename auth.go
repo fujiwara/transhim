@@ -59,9 +59,10 @@ type AuthRequest struct {
 // also rejects the request, with the status its kind maps to (for example 502
 // for ErrUpstream, 500 otherwise).
 //
-// It is called after the request body was read (up to the size limit) and
-// before anything in it is reported as wrong, so a client that is refused
-// learns nothing about its body.
+// It is called after the request body was read (up to the size limit, and
+// within the time limit of WithBodyReadTimeout) and before anything in it is
+// reported as wrong, so a client that is refused learns nothing about its
+// body.
 //
 // Clients such as Ceph RGW do not check whether an S3 user may use a given key
 // name. If that matters, check it here. A Backend can restrict which keys a
