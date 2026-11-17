@@ -65,6 +65,8 @@ type event struct {
 	MountID string
 	KeyName string
 	Status  int
+	// Context is the context RGW sent, decoded.
+	Context string
 }
 
 func (e event) String() string {
@@ -128,7 +130,7 @@ func newHarness(t *testing.T, decryptCache bool) *harness {
 		transhim.WithAuditHook(func(_ context.Context, ev transhim.AuditEvent) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			h.events = append(h.events, event{ev.Op, ev.MountID, ev.KeyName, ev.Status})
+			h.events = append(h.events, event{ev.Op, ev.MountID, ev.KeyName, ev.Status, string(ev.Context)})
 		}),
 	}
 	if decryptCache {

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,12 +24,17 @@ import (
 // DefaultMaxBodySize is the default limit for request bodies.
 const DefaultMaxBodySize = 1 << 20
 
+// DefaultBodyReadTimeout is the default limit for the time a client may take
+// to send its request body.
+const DefaultBodyReadTimeout = 10 * time.Second
+
 type config struct {
 	mounts               []*mount
 	authorizer           Authorizer
 	allowUnauthenticated bool
 	logger               *slog.Logger
 	maxBodySize          int64
+	bodyReadTimeout      time.Duration
 	cache                *DecryptCacheConfig
 	auditHook            AuditHook
 }
@@ -80,6 +86,25 @@ func WithMaxBodySize(n int64) Option {
 	}
 }
 
+// WithBodyReadTimeout sets how long a client may take to send its request
+// body. The default is DefaultBodyReadTimeout. Bodies are read before the
+// request is authorized, so this is what stops a client that is not let in
+// from keeping a connection busy by sending slowly.
+//
+// The limit is a read deadline on the connection, which the server lifts
+// again once it has the body: a deadline set by http.Server.ReadTimeout ends
+// there as well, and does not run into the time the backend takes. It has no
+// effect behind an http.ResponseWriter that cannot set deadlines.
+func WithBodyReadTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return errors.New("body read timeout must be positive")
+		}
+		c.bodyReadTimeout = d
+		return nil
+	}
+}
+
 // WithDecryptCache enables the decrypt cache, which is off by default. It
 // answers repeated decrypt requests for the same ciphertext, key name, and
 // context without calling the backend. Concurrent requests of that kind share
@@ -113,11 +138,12 @@ func WithAuditHook(fn AuditHook) Option {
 // Server is an http.Handler that serves the Vault Transit API for its mounts.
 // It serves nothing outside of them.
 type Server struct {
-	mounts      []*mount // longest prefix first
-	authorizer  Authorizer
-	logger      *slog.Logger
-	maxBodySize int64
-	cache       *decryptCache // nil if disabled
+	mounts          []*mount // longest prefix first
+	authorizer      Authorizer
+	logger          *slog.Logger
+	maxBodySize     int64
+	bodyReadTimeout time.Duration
+	cache           *decryptCache // nil if disabled
 	// decryptFlight merges concurrent decrypts of the same request into one
 	// backend call. It is only used with the cache.
 	decryptFlight singleflight.Group
@@ -133,7 +159,7 @@ type Server struct {
 // NewServer builds a Server. It needs at least one Mount, and either
 // WithAuthorizer or an explicit AllowUnauthenticated.
 func NewServer(opts ...Option) (*Server, error) {
-	c := &config{maxBodySize: DefaultMaxBodySize}
+	c := &config{maxBodySize: DefaultMaxBodySize, bodyReadTimeout: DefaultBodyReadTimeout}
 	for _, opt := range opts {
 		if err := opt(c); err != nil {
 			return nil, fmt.Errorf("transhim: %w", err)
@@ -156,6 +182,7 @@ func NewServer(opts ...Option) (*Server, error) {
 		authorizer:      c.authorizer,
 		logger:          c.logger,
 		maxBodySize:     c.maxBodySize,
+		bodyReadTimeout: c.bodyReadTimeout,
 		auditHook:       c.auditHook,
 		deletionAllowed: map[keyID]struct{}{},
 	}
@@ -226,6 +253,8 @@ func parseOp(method, rest string) (Op, string, error) {
 
 // request is the state of one request being served.
 type request struct {
+	// context is the decoded context of the request body, or nil.
+	context  []byte
 	id       string
 	op       Op
 	mount    *mount
@@ -274,6 +303,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Time:       start,
 			Op:         req.op,
 			KeyName:    req.keyName,
+			Context:    req.context,
 			CacheHit:   req.cacheHit,
 			Duration:   time.Since(start),
 			Status:     status,
@@ -313,11 +343,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 	}
 	req.keyName = name
 
+	// The body is read before the request is authorized, because the
+	// authorizer is told the context. A body that cannot be used is reported
+	// only after that: a client that is not allowed in gets a 403 whatever it
+	// sent.
+	body, bodyErr := s.readBody(w, r)
+	if bodyErr == nil {
+		req.context, bodyErr = requestContext(op, body)
+	}
 	if s.authorizer != nil {
 		err := s.authorizer(r.Context(), AuthRequest{
 			Op:         op,
 			MountID:    m.id,
 			KeyName:    name,
+			Context:    bytes.Clone(req.context),
 			Token:      r.Header.Get("X-Vault-Token"),
 			Namespace:  r.Header.Get("X-Vault-Namespace"),
 			TLS:        r.TLS,
@@ -327,10 +366,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 			return nil, err
 		}
 	}
-
-	body, err := s.readBody(w, r)
-	if err != nil {
-		return nil, err
+	if bodyErr != nil {
+		return nil, bodyErr
 	}
 	switch op {
 	case OpDataKey:
@@ -349,14 +386,31 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 	return nil, fmt.Errorf("unhandled operation %q", op)
 }
 
-// readBody reads the whole request body, up to the size limit.
+// readBody reads the whole request body, up to the size limit and within the
+// time limit.
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	rc := http.NewResponseController(w)
+	timed := rc.SetReadDeadline(time.Now().Add(s.bodyReadTimeout)) == nil
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBodySize))
 	if err != nil {
+		// The rest of the body is not wanted. Without this, net/http reads
+		// on to keep the connection for the next request; the deadline,
+		// which stays in place, bounds whatever it still reads.
+		w.Header().Set("Connection", "close")
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			return nil, &requestError{status: http.StatusRequestEntityTooLarge, msg: "request body too large"}
 		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil, &requestError{status: http.StatusRequestTimeout, msg: "request body not received in time"}
+		}
 		return nil, badRequest("failed to read request body")
+	}
+	if timed {
+		// The deadline must not outlive the read: net/http keeps reading
+		// from the connection while the handler runs, and a deadline that
+		// passes then cancels the request's context in the middle of a
+		// backend call.
+		rc.SetReadDeadline(time.Time{})
 	}
 	return body, nil
 }
@@ -374,22 +428,38 @@ func decodeBody(body []byte, v any) error {
 	return nil
 }
 
-// decodeContext decodes the base64 "context" field. An absent and an empty
-// context are the same.
-func decodeContext(s string) ([]byte, error) {
-	if s == "" {
+// requestContext returns the decoded "context" field of a datakey, encrypt, or
+// decrypt request. The other operations have none. An absent and an empty
+// context are the same: nil.
+//
+// This is the one place where the context is taken from the body, so that the
+// authorizer and the audit hook see exactly what is bound into the ciphertext.
+func requestContext(op Op, body []byte) ([]byte, error) {
+	if op != OpDataKey && op != OpEncrypt && op != OpDecrypt {
 		return nil, nil
 	}
-	b, err := base64.StdEncoding.DecodeString(s)
+	var in struct {
+		Context string `json:"context"`
+	}
+	if err := decodeBody(body, &in); err != nil {
+		return nil, err
+	}
+	if in.Context == "" {
+		return nil, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(in.Context)
 	if err != nil {
 		return nil, badRequest("failed to base64-decode context")
+	}
+	if len(b) == 0 {
+		// "\r\n" is valid base64 for nothing: the decoder skips line ends
+		return nil, nil
 	}
 	return b, nil
 }
 
 type dataKeyBody struct {
-	Context string `json:"context"`
-	Bits    *int   `json:"bits"`
+	Bits *int `json:"bits"`
 }
 
 type dataKeyData struct {
@@ -410,10 +480,7 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 	if bits != 128 && bits != 256 && bits != 512 {
 		return nil, badRequest("invalid bit length")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	m := req.mount
 	aad := buildAAD(m.id, req.keyName, keyContext)
 	size := bits / 8
@@ -424,6 +491,7 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 
 	var plaintext []byte
 	var wk WrappedKey
+	var err error
 	if g, ok := m.backend.(DataKeyGenerator); ok {
 		plaintext, wk, err = g.GenerateDataKey(ctx, DataKeyRequest{
 			MountID: m.id, KeyName: req.keyName, Bytes: size, AAD: aad,
@@ -457,7 +525,6 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 
 type encryptBody struct {
 	Plaintext  *string `json:"plaintext"`
-	Context    string  `json:"context"`
 	KeyVersion int     `json:"key_version"`
 }
 
@@ -487,10 +554,7 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 	if len(plaintext) > m.maxPlaintextSize {
 		return nil, badRequest("plaintext too large")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	wk, err := m.backend.Encrypt(ctx, EncryptRequest{
 		MountID:   m.id,
 		KeyName:   req.keyName,
@@ -509,7 +573,6 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 
 type decryptBody struct {
 	Ciphertext *string `json:"ciphertext"`
-	Context    string  `json:"context"`
 }
 
 type decryptData struct {
@@ -524,10 +587,7 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	if in.Ciphertext == nil {
 		return nil, badRequest("missing ciphertext to decrypt")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	wk, err := decodeEnvelope(*in.Ciphertext)
 	if err != nil {
 		return nil, err
