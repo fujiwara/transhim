@@ -29,7 +29,7 @@ The name means "**tran**sit **shim**".
 - G2. Make the user-facing extension point small. A user should only need to implement `Encrypt` and `Decrypt` against their KMS to get a working server.
 - G3. Provide the `encrypt` endpoint. RGW may never call it, but every other Transit client needs it (see §4), so it is part of v1. It is the **only** v1 endpoint that is not driven by RGW.
 - G4. Correct-by-default security. The ciphertext is bound to the key name and context. The decrypt cache is safe. Plaintext keys are never logged.
-- G5. Keep the core free of third-party dependencies (stdlib only). Cloud SDKs live only in examples or separate modules.
+- G5. Keep the core free of third-party dependencies: the standard library and `golang.org/x` only. Cloud SDKs live only in examples or separate modules.
 - G6. Be testable without any cloud account. Provide an in-memory fake backend and a conformance test suite.
 
 ### v1 scope rule
@@ -142,7 +142,7 @@ RustFS has a `vault-transit` KMS backend. The exact endpoint set is **unknown** 
 ### Package layout
 
 ```
-transhim/                 core (stdlib only)
+transhim/                 core (stdlib and golang.org/x only)
   server.go               Server, options, routing, handlers
   mount.go
   auth.go                 Authorizer, AuthRequest
@@ -422,6 +422,7 @@ Behavior:
 - `CreateKey`: look the key up in the KeyStore first and return success if it exists, without a root call (RGW re-creates existing keys after `DeleteBucketEncryption`). Otherwise generate a 32-byte intermediate key, wrap it with root `Encrypt` as described above, and call `PutIfAbsent`. On `ErrKeyExists`, discard the generated key and return success (the existing key wins). This makes `CreateKey` idempotent and safe under concurrent creation.
 - `Encrypt`/`Decrypt`: load and unwrap the intermediate key, then apply AES-256-GCM locally with a random 12-byte nonce, `Blob = nonce || ct`, and the AAD from the core. `KeyRef` is set to `"h1"`.
 - Unwrapped intermediate keys are cached in memory, keyed by `(mountID, keyName)`, with their own TTL (`WithKeyCacheTTL`, default 5 minutes, 0 disables). They are evicted on `DeleteKey`, also when the KeyStore reports a failure. A key that was being loaded while a deletion happened is not cached. A key that `CreateKey` just stored is cached, so the `datakey` call that RGW sends next needs no root call.
+- Concurrent loads of the same intermediate key (first use, or after its cache entry expired) are merged into one KeyStore read and one root call, for the same reason and with the same cancellation rule as in §9.
 - Root backend errors are passed on only if they are `ErrUpstream`, `ErrPermissionDenied`, or a context error. Anything else (the root key is missing, a stored key does not unwrap) becomes an internal error: it is not the client's key or ciphertext that is wrong.
 - `DeleteKey`: delete from the KeyStore and evict from the cache. This is the crypto-shredding point.
 - Eviction is local to the process. When several transhim instances share a KeyStore, the other instances keep the unwrapped intermediate key until its TTL expires, so crypto-shredding completes only after at most that TTL (plus the decrypt cache TTL, §9). Documentation must state this.
@@ -440,6 +441,7 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 - Bounded by `MaxEntries` (LRU) and `TTL`. Both are required when the cache is enabled.
 - Invalidation: on `DELETE keys/{name}`, all entries for `(mount_id, name)` are removed. This requires a secondary index from `(mount_id, name)` to a set of cache keys. Invalidation is local to the process: with several transhim instances, the others keep serving cached plaintext until TTL.
 - Errors are never cached.
+- Concurrent decrypts of the same request (same cache key) that miss the cache are merged into one backend call (`singleflight`); the others wait for its result. RGW sends such bursts (the parts of a multipart upload), and a KMS can take seconds per call and serve concurrent calls one after the other. The merged call does not inherit the cancellation of the request that started it, so that the waiting requests are not failed by another client going away. Without the cache nothing is merged.
 - A cache hit never bypasses the authorizer: authorization runs before the lookup.
 - A decrypt that is in flight while its key is deleted must not store its result afterwards. The cache counts invalidations, and a result is only stored if no invalidation happened since the backend call started.
 - `datakey` and `encrypt` responses are never cached. However, the plaintext produced by `datakey` *may* be inserted into the decrypt cache, behind the option `WarmOnDatakey`, which defaults to false.

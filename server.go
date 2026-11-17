@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // DefaultMaxBodySize is the default limit for request bodies.
@@ -107,11 +109,14 @@ func WithAuditHook(fn AuditHook) Option {
 // Server is an http.Handler that serves the Vault Transit API for its mounts.
 // It serves nothing outside of them.
 type Server struct {
-	mounts        []*mount // longest prefix first
-	authorizer    Authorizer
-	logger        *slog.Logger
-	maxBodySize   int64
-	cache         *decryptCache // nil if disabled
+	mounts      []*mount // longest prefix first
+	authorizer  Authorizer
+	logger      *slog.Logger
+	maxBodySize int64
+	cache       *decryptCache // nil if disabled
+	// decryptFlight merges concurrent decrypts of the same request into one
+	// backend call. It is only used with the cache.
+	decryptFlight singleflight.Group
 	warmOnDatakey bool
 	auditHook     AuditHook
 
@@ -401,12 +406,12 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 	if bits != 128 && bits != 256 && bits != 512 {
 		return nil, badRequest("invalid bit length")
 	}
-	context, err := decodeContext(in.Context)
+	keyContext, err := decodeContext(in.Context)
 	if err != nil {
 		return nil, err
 	}
 	m := req.mount
-	aad := buildAAD(m.id, req.keyName, context)
+	aad := buildAAD(m.id, req.keyName, keyContext)
 	size := bits / 8
 	var gen uint64
 	if s.warmOnDatakey {
@@ -440,7 +445,7 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 		KeyVersion: keyVersion(wk),
 	}
 	if s.warmOnDatakey {
-		s.cache.put(newCacheKey(m.id, req.keyName, context, data.Ciphertext), req.keyID(), plaintext, gen)
+		s.cache.put(newCacheKey(m.id, req.keyName, keyContext, data.Ciphertext), req.keyID(), plaintext, gen)
 	}
 	clear(plaintext)
 	return &result{data: data}, nil
@@ -478,7 +483,7 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 	if len(plaintext) > m.maxPlaintextSize {
 		return nil, badRequest("plaintext too large")
 	}
-	context, err := decodeContext(in.Context)
+	keyContext, err := decodeContext(in.Context)
 	if err != nil {
 		return nil, err
 	}
@@ -486,7 +491,7 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 		MountID:   m.id,
 		KeyName:   req.keyName,
 		Plaintext: plaintext,
-		AAD:       buildAAD(m.id, req.keyName, context),
+		AAD:       buildAAD(m.id, req.keyName, keyContext),
 	})
 	if err != nil {
 		return nil, err
@@ -515,7 +520,7 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	if in.Ciphertext == nil {
 		return nil, badRequest("missing ciphertext to decrypt")
 	}
-	context, err := decodeContext(in.Context)
+	keyContext, err := decodeContext(in.Context)
 	if err != nil {
 		return nil, err
 	}
@@ -525,33 +530,52 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	}
 	m := req.mount
 
-	var ck cacheKey
-	var gen uint64
-	if s.cache != nil {
-		ck = newCacheKey(m.id, req.keyName, context, *in.Ciphertext)
-		if plaintext, ok := s.cache.get(ck); ok {
-			req.cacheHit = true
-			data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
-			clear(plaintext)
-			return &result{data: data}, nil
-		}
-		gen = s.cache.generation()
-	}
-	plaintext, err := m.backend.Decrypt(ctx, DecryptRequest{
+	dreq := DecryptRequest{
 		MountID: m.id,
 		KeyName: req.keyName,
 		Wrapped: wk,
-		AAD:     buildAAD(m.id, req.keyName, context),
+		AAD:     buildAAD(m.id, req.keyName, keyContext),
+	}
+	if s.cache == nil {
+		plaintext, err := m.backend.Decrypt(ctx, dreq)
+		if err != nil {
+			return nil, err
+		}
+		data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
+		clear(plaintext)
+		return &result{data: data}, nil
+	}
+
+	ck := newCacheKey(m.id, req.keyName, keyContext, *in.Ciphertext)
+	if plaintext, ok := s.cache.get(ck); ok {
+		req.cacheHit = true
+		data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
+		clear(plaintext)
+		return &result{data: data}, nil
+	}
+	// RGW sends the same decrypt many times at once (the parts of a multipart
+	// upload). With a slow KMS they would all miss the cache and queue up
+	// behind each other, so only the first one calls the backend and the
+	// others wait for its result.
+	//
+	// The call must not die with the request that happened to start it, so
+	// it does not inherit that request's cancellation. Every request that
+	// gets here was authorized on its own.
+	encoded, err, _ := s.decryptFlight.Do(string(ck[:]), func() (any, error) {
+		gen := s.cache.generation()
+		plaintext, err := m.backend.Decrypt(context.WithoutCancel(ctx), dreq)
+		if err != nil {
+			return nil, err
+		}
+		defer clear(plaintext)
+		s.cache.put(ck, req.keyID(), plaintext, gen)
+		// shared by all waiting requests, hence an immutable string
+		return base64.StdEncoding.EncodeToString(plaintext), nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if s.cache != nil {
-		s.cache.put(ck, req.keyID(), plaintext, gen)
-	}
-	data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
-	clear(plaintext)
-	return &result{data: data}, nil
+	return &result{data: &decryptData{Plaintext: encoded.(string)}}, nil
 }
 
 // unmanaged answers a key operation on a mount whose backend has no

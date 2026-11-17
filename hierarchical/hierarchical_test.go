@@ -797,3 +797,91 @@ func TestBehindServer(t *testing.T) {
 		t.Errorf("decrypt after delete: %d %v", status, dec)
 	}
 }
+
+// TestConcurrentLoadsAreMerged: with a slow KMS as root, requests for a key
+// that is not in memory must share one load.
+func TestConcurrentLoadsAreMerged(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	for _, name := range []string{"a", "b"} {
+		if err := f.b.CreateKey(ctx, mountID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wk := encrypt(t, f.b, "a", "p", "")
+
+	// a second instance has nothing in memory, like after a restart
+	cold, err := hierarchical.New(f.root, rootKey, f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.root.SetDelay(200 * time.Millisecond)
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			if got, err := decrypt(t, cold, "a", wk, ""); err != nil || string(got) != "p" {
+				t.Errorf("Decrypt = %q, %v", got, err)
+			}
+		})
+	}
+	// another key is another load
+	wg.Go(func() { encrypt(t, cold, "b", "p", "") })
+	wg.Wait()
+	if _, d := f.rootCalls(); d != 2 {
+		t.Errorf("root Decrypt called %d times, want 2 (one per key)", d)
+	}
+
+	t.Run("failures are shared but not kept", func(t *testing.T) {
+		cold, _ := hierarchical.New(f.root, rootKey, f.store)
+		f.root.SetError(transhimtest.OpDecrypt, transhim.ErrUpstream)
+		_, before := f.rootCalls()
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				if _, err := decrypt(t, cold, "a", wk, ""); !errors.Is(err, transhim.ErrUpstream) {
+					t.Errorf("err = %v, want ErrUpstream", err)
+				}
+			})
+		}
+		wg.Wait()
+		if _, d := f.rootCalls(); d-before != 1 {
+			t.Errorf("root Decrypt called %d times, want 1", d-before)
+		}
+		f.root.SetError(transhimtest.OpDecrypt, nil)
+		if _, err := decrypt(t, cold, "a", wk, ""); err != nil {
+			t.Errorf("Decrypt after the root recovered: %v", err)
+		}
+	})
+}
+
+// TestLoadSurvivesCanceledRequest: when the request that started a load goes
+// away, the requests waiting for the same key must still get it.
+func TestLoadSurvivesCanceledRequest(t *testing.T) {
+	f := newFixture(t)
+	if err := f.b.CreateKey(t.Context(), mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	wk := encrypt(t, f.b, bucket, "p", "")
+	cold, _ := hierarchical.New(f.root, rootKey, f.store)
+	f.root.SetDelay(200 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		cold.Decrypt(ctx, transhim.DecryptRequest{MountID: mountID, KeyName: bucket, Wrapped: wk})
+	})
+	for _, d := f.rootCalls(); d == 0; _, d = f.rootCalls() {
+		time.Sleep(time.Millisecond)
+	}
+	wg.Go(func() {
+		if got, err := decrypt(t, cold, bucket, wk, ""); err != nil || string(got) != "p" {
+			t.Errorf("waiting request: %q, %v", got, err)
+		}
+	})
+	time.Sleep(20 * time.Millisecond) // let the second request join
+	cancel()
+	wg.Wait()
+	if _, d := f.rootCalls(); d != 1 {
+		t.Errorf("root Decrypt called %d times, want 1", d)
+	}
+}

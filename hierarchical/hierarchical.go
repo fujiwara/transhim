@@ -20,6 +20,9 @@
 //     deletion. Other instances sharing the KeyStore keep using it until
 //     their cache entry expires, so the deletion is complete only after that
 //     TTL (and after the TTL of the server's decrypt cache, if enabled).
+//   - Loading a key (first use, or after its cache entry expired) costs one
+//     KeyStore read and one root backend call. Requests for the same key that
+//     arrive meanwhile wait for that load instead of starting their own.
 //   - A key is not always deleted when its bucket is: see docs/compat.md.
 //     Orphaned intermediate keys can stay behind in the KeyStore.
 package hierarchical
@@ -35,6 +38,7 @@ import (
 	"time"
 
 	"github.com/fujiwara/transhim"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -95,6 +99,9 @@ type Backend struct {
 	// cached: it may be the one that was just deleted.
 	gen       uint64
 	nextSweep time.Time
+
+	// loads merges concurrent loads of the same key into one.
+	loads singleflight.Group
 }
 
 var (
@@ -210,6 +217,31 @@ func (b *Backend) remember(id keyID, aead cipher.AEAD, gen uint64) {
 // key returns the cipher for the intermediate key of (mountID, keyName).
 func (b *Backend) key(ctx context.Context, mountID, keyName string) (cipher.AEAD, error) {
 	id := keyID{mountID, keyName}
+	if aead, _ := b.cached(id); aead != nil {
+		return aead, nil
+	}
+	// When a key is not in memory (first use, or its cache entry expired),
+	// every request for it that arrives before the load finishes would call
+	// the KeyStore and the root backend. The root backend is a KMS and may be
+	// slow, and may serve concurrent calls one after the other. So the first
+	// request loads the key and the others wait for it.
+	//
+	// The load must not die with the request that happened to start it, so
+	// it does not inherit that request's cancellation.
+	flightKey := fmt.Sprintf("%d:%s%s", len(mountID), mountID, keyName)
+	v, err, _ := b.loads.Do(flightKey, func() (any, error) {
+		return b.load(context.WithoutCancel(ctx), mountID, keyName)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(cipher.AEAD), nil
+}
+
+// load fetches the intermediate key from the KeyStore and unwraps it.
+func (b *Backend) load(ctx context.Context, mountID, keyName string) (cipher.AEAD, error) {
+	id := keyID{mountID, keyName}
+	// a load that finished just before this one started may have cached it
 	aead, gen := b.cached(id)
 	if aead != nil {
 		return aead, nil

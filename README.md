@@ -63,7 +63,7 @@ transhim.Mount("/v1/transit-sse-s3", "rgw-sse-s3", sseS3)
 - **The `KeyStore` is state you must not lose.** A lost entry makes every object encrypted with that key unreadable. The stored keys are wrapped, so the store need not be secret, but it must be durable. `keystore/memstore` is for tests and development only.
 - **The root key name is permanent**, like the mount ID: both are bound into the stored keys.
 - Deleting a key deletes its intermediate key, which makes the bucket's data unreadable (crypto-shredding). This is best effort: RGW does not always delete the key of a deleted bucket (see [docs/compat.md](docs/compat.md)), so orphaned keys can stay in the store.
-- Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). With several transhim instances sharing a store, a key deleted through one instance stays usable through the others until that TTL has passed.
+- Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). Loading one costs a `KeyStore` read and a KMS call; requests for the same key that arrive meanwhile wait for that load instead of starting their own. With several transhim instances sharing a store, a key deleted through one instance stays usable through the others until that TTL has passed.
 
 ### Decrypt cache
 
@@ -75,6 +75,8 @@ transhim.WithDecryptCache(transhim.DecryptCacheConfig{
 	TTL:        5 * time.Minute,
 })
 ```
+
+Identical decrypts that arrive at the same time share one KMS call, which matters when the KMS is slow.
 
 It is off by default. It holds plaintext data keys in memory, so **the TTL is the longest time a revocation can take to become effective** when it happens behind the server's back: disabling a key directly in the KMS, or deleting a key through another transhim instance. Deleting a key through the same instance removes its entries at once. Requests are authorized before the cache is consulted.
 

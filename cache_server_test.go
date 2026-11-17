@@ -3,6 +3,8 @@ package transhim_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -214,4 +216,114 @@ func TestDecryptCacheConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// TestDecryptCacheMergesConcurrentDecrypts: with a slow KMS, identical
+// decrypts that arrive together must share one backend call instead of all
+// missing the cache.
+func TestDecryptCacheMergesConcurrentDecrypts(t *testing.T) {
+	e := newEnv(t, cacheOption(false))
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	other := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	body := jsonBody(map[string]any{"ciphertext": dk.str("ciphertext"), "context": rgwContext})
+	otherBody := jsonBody(map[string]any{"ciphertext": other.str("ciphertext"), "context": rgwContext})
+
+	e.backend.SetDelay(200 * time.Millisecond)
+	n := e.decryptCalls(func() {
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				d := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", body)
+				if d.status != http.StatusOK || d.str("plaintext") != dk.str("plaintext") {
+					t.Errorf("decrypt: %d %q", d.status, d.body)
+				}
+			})
+		}
+		// a different ciphertext is a different call
+		wg.Go(func() {
+			d := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", otherBody)
+			if d.status != http.StatusOK || d.str("plaintext") != other.str("plaintext") {
+				t.Errorf("decrypt of the other key: %d %q", d.status, d.body)
+			}
+		})
+		wg.Wait()
+	})
+	if n != 2 {
+		t.Errorf("backend called %d times, want 2 (one per ciphertext)", n)
+	}
+
+	t.Run("failures are shared but not kept", func(t *testing.T) {
+		third := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", "")
+		thirdBody := jsonBody(map[string]any{"ciphertext": third.str("ciphertext")})
+		e.backend.SetError(transhimtest.OpDecrypt, transhim.ErrUpstream)
+		n := e.decryptCalls(func() {
+			var wg sync.WaitGroup
+			for range 8 {
+				wg.Go(func() {
+					e.wantError(e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", thirdBody), 502, "upstream key service error")
+				})
+			}
+			wg.Wait()
+		})
+		if n != 1 {
+			t.Errorf("backend called %d times, want 1", n)
+		}
+		e.backend.SetError(transhimtest.OpDecrypt, nil)
+		if d := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", thirdBody); d.status != http.StatusOK {
+			t.Errorf("decrypt after the failure: %d %q", d.status, d.body)
+		}
+	})
+}
+
+// TestDecryptSurvivesCanceledRequest: when the request that started a backend
+// call goes away, the requests waiting for the same result must still get it.
+func TestDecryptSurvivesCanceledRequest(t *testing.T) {
+	e := newEnv(t, cacheOption(false))
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", "")
+	body := jsonBody(map[string]any{"ciphertext": dk.str("ciphertext")})
+	e.backend.SetDelay(200 * time.Millisecond)
+	before := e.backend.Calls(transhimtest.OpDecrypt)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/transit-kms/decrypt/key1", strings.NewReader(body)).WithContext(ctx)
+		req.Header.Set("X-Vault-Token", testToken)
+		e.handler.ServeHTTP(httptest.NewRecorder(), req)
+	})
+	// wait until the first request is inside the backend
+	for e.backend.Calls(transhimtest.OpDecrypt) == before {
+		time.Sleep(time.Millisecond)
+	}
+	wg.Go(func() {
+		d := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", body)
+		if d.status != http.StatusOK || d.str("plaintext") != dk.str("plaintext") {
+			t.Errorf("waiting request: %d %q", d.status, d.body)
+		}
+	})
+	time.Sleep(20 * time.Millisecond) // let the second request join
+	cancel()
+	wg.Wait()
+	if n := e.backend.Calls(transhimtest.OpDecrypt) - before; n != 1 {
+		t.Errorf("backend called %d times, want 1", n)
+	}
+}
+
+// TestNoMergingWithoutCache: without the cache every decrypt reaches the
+// backend, as before.
+func TestNoMergingWithoutCache(t *testing.T) {
+	e := newEnv(t)
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", "")
+	body := jsonBody(map[string]any{"ciphertext": dk.str("ciphertext")})
+	e.backend.SetDelay(50 * time.Millisecond)
+	n := e.decryptCalls(func() {
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() { e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", body) })
+		}
+		wg.Wait()
+	})
+	if n != 4 {
+		t.Errorf("backend called %d times, want 4", n)
+	}
 }
