@@ -120,6 +120,9 @@ func RunConformance(t *testing.T, c Conformance) {
 		for _, plaintext := range []string{"hello", "", strings.Repeat("x", c.MaxPlaintextSize)} {
 			body := jsonBody(map[string]any{"plaintext": b64(plaintext), "context": b64("ctx")})
 			r := s.post(t, "encrypt/"+key1, body)
+			if plaintext == "" && r.status == http.StatusBadRequest {
+				continue // a KMS may refuse to encrypt nothing (AWS KMS does)
+			}
 			if !s.wantOK(t, r) {
 				continue
 			}

@@ -71,3 +71,55 @@ jobs:
         if: ${{ failure() }}
         run: |
           docker compose logs --tail 200 ceph
+
+  # The AWS KMS example, tested against the AWS Emulator.
+  awskms:
+    name: AWS KMS example
+    runs-on: ubuntu-latest
+    env:
+      # https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/versions.json
+      AWS_EMULATOR_VERSION: "1.0.486"
+      AWS_EMULATOR_KEY_FINGERPRINT: 98BCF336A3BE53B734E967C52E5BF49BD940F624
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27"
+          cache-dependency-path: examples/awskms/go.sum
+
+      - name: Start AWS Emulator
+        run: |
+          base=https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS
+          deb="aws-emulator_${AWS_EMULATOR_VERSION}-1_amd64.deb"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/$deb"
+          curl -fsSLO "$base/$deb.sig"
+          curl -fsSLo aws-emulator-key.asc https://downloads.aws.com/keys/gpg/current.asc
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import aws-emulator-key.asc
+          gpg --batch --status-fd 1 --verify "$deb.sig" "$deb" \
+            | grep -q "^\[GNUPG:\] VALIDSIG .* ${AWS_EMULATOR_KEY_FINGERPRINT}\$"
+          sudo apt-get install -y "./$deb"
+          aws-emulator -v
+          nohup aws-emulator --telemetry off --auth off > aws-emulator.log 2>&1 &
+          ca="$HOME/.aws/emulator/9297/ca.pem"
+          for _ in $(seq 1 30); do
+            if curl -fs --cacert "$ca" https://127.0.0.1:9297/__admin/health; then
+              echo "AWS_CA_BUNDLE=$ca" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat aws-emulator.log
+          exit 1
+
+      - name: Build & Test
+        working-directory: examples/awskms
+        run: |
+          go build ./...
+          go test -race -count=1 -v ./...
+        env:
+          TRANSHIM_TEST_KMS_ENDPOINT: https://127.0.0.1:9297

@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1–M4 implemented: v1 is accepted against Ceph 18.2.8, 19.2.7, and 20.2.5)
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); all milestones implemented: v1 is accepted against Ceph 18.2.8, 19.2.7, and 20.2.5)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -157,6 +157,7 @@ transhim/                 core (stdlib and golang.org/x only)
 examples/
   awskms/                 separate go.mod; AWS KMS backend + example main
   gcpkms/                 separate go.mod (optional, later)
+integration/              separate go.mod; acceptance test against Ceph RGW
 ```
 
 Go version: the two latest stable Go releases (1.26 and 1.27 at implementation time). Module path: `github.com/fujiwara/transhim`.
@@ -455,10 +456,10 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 
 ## 11. Examples
 
-- `examples/awskms`: an AWS KMS backend implementing `Backend` + `DataKeyGenerator`. AAD maps to `EncryptionContext{"transhim-aad": hex(sha256(AAD))}`. The hash keeps the value at a fixed length regardless of the context size, so it cannot exceed the KMS encryption context limit. This mapping is part of the on-disk compatibility contract of the example backend. `KeyRef` is the key ARN returned by KMS. The example `main` mounts:
+- `examples/awskms`: an AWS KMS backend implementing `Backend` + `DataKeyGenerator`. AAD maps to `EncryptionContext{"transhim-aad": hex(sha256(AAD))}`. The hash keeps the value at a fixed length regardless of the context size, so it cannot exceed the KMS encryption context limit. This mapping is part of the on-disk compatibility contract of the example backend. `KeyRef` is the key ARN returned by KMS; it is informational, because a client can change it. `Decrypt` names the KMS key that the key name resolves to, so KMS refuses a ciphertext of any other key. An empty plaintext is rejected with `ErrInvalidRequest`, since KMS encrypts 1 to 4096 bytes. The backend is tested against the AWS Emulator, including the conformance suite on both mounts. The example `main` mounts:
   - `/v1/transit-kms` (mount ID `rgw-kms`) → AWS backend, with key name resolved as `alias/rgw/{name}`
   - `/v1/transit-sse-s3` (mount ID `rgw-sse-s3`) → hierarchical backend (root = AWS backend with a fixed `rootKeyName`, store = memstore with a "DO NOT USE IN PROD" warning)
-- The README must include the matching Ceph RGW configuration snippet.
+- The README includes the matching Ceph RGW configuration snippet; `docs/rgw.md` is the full guide.
 
 ## 12. Compatibility Verification Tasks (must be done during implementation)
 
@@ -500,7 +501,7 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 2. **M2 – Key ops** (done): `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
 3. **M3 – Hierarchical backend** (done) + memstore + tests.
 4. **M4 – RGW acceptance** (done): golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
-5. **M5 – Examples & docs**: AWS KMS example, RGW configuration guide, README.
+5. **M5 – Examples & docs** (done): AWS KMS example, RGW configuration guide, README.
 
 Not in v1 (see §3): token stubs, `sys/health`, `GET keys/{name}`, and §12 items 3 and 5.
 

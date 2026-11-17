@@ -4,10 +4,23 @@ A Go framework for building HashiCorp Vault Transit–compatible API servers who
 
 The first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
 
-**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. The hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) is implemented as well. It is tested against real Ceph RGW releases 18.2.8 (reef), 19.2.7 (squid), and 20.2.5 (tentacle), for SSE-KMS and SSE-S3. Still missing: the AWS KMS example. The API may change until the first release.
+**Status: pre-release.** v1 is feature complete and tested against real Ceph RGW releases 18.2.8 (reef), 19.2.7 (squid), and 20.2.5 (tentacle), but nothing has been released yet and the API may still change.
 
+What it does:
+
+- Serves the part of the Transit API that Ceph RGW uses (`datakey/plaintext`, `decrypt`, key create/config/delete) plus `encrypt`.
+- Delegates the cryptography to a small Go interface you implement against your KMS: `Encrypt` and `Decrypt`.
+- Binds every ciphertext to its mount, key name, and context, so that it cannot be decrypted under another one.
+- Offers per-bucket keys without one KMS key per bucket (the hierarchical backend), a decrypt cache for slow KMS services, an authorization hook, and an audit hook.
+
+What it is not: a Vault replacement, or a ready-made server. You write your own `main`; [examples/awskms](examples/awskms) is one for AWS KMS.
+
+Documents:
+
+- [docs/rgw.md](docs/rgw.md): configuring Ceph RGW, and what to know before going live
+- [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, how it reacts to failures, and where transhim differs from Vault
 - [docs/DESIGN.md](docs/DESIGN.md): design document
-- [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, and how the reference implementation answers
+- [examples/awskms](examples/awskms): an AWS KMS backend and an example server
 
 ## Usage
 
@@ -25,7 +38,7 @@ func (k *myKMS) Decrypt(ctx context.Context, req transhim.DecryptRequest) ([]byt
 func main() {
 	srv, err := transhim.NewServer(
 		// prefix (routing only), mount ID (bound into every ciphertext), backend
-		transhim.Mount("/v1/transit", "rgw-kms", &myKMS{}),
+		transhim.Mount("/v1/transit-kms", "rgw-kms", &myKMS{}),
 		transhim.WithAuthorizer(transhim.StaticTokenAuthorizer(os.Getenv("VAULT_TOKEN"))),
 	)
 	if err != nil {
@@ -66,6 +79,29 @@ transhim.Mount("/v1/transit-sse-s3", "rgw-sse-s3", sseS3)
 - Deleting a key deletes its intermediate key, which makes the bucket's data unreadable (crypto-shredding). This is best effort: RGW does not always delete the key of a deleted bucket (see [docs/compat.md](docs/compat.md)), so orphaned keys can stay in the store.
 - Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). Loading one costs a `KeyStore` read and a KMS call; requests for the same key that arrive meanwhile wait for that load instead of starting their own. With several transhim instances sharing a store, a key deleted through one instance stays usable through the others until that TTL has passed.
 
+### Ceph RGW configuration
+
+With the two mounts shown above, `/v1/transit-kms` for SSE-KMS and `/v1/transit-sse-s3` for SSE-S3:
+
+```ini
+[client.rgw]
+rgw_crypt_s3_kms_backend = vault
+rgw_crypt_vault_secret_engine = transit
+rgw_crypt_vault_addr = https://transhim.example.com:8200
+rgw_crypt_vault_prefix = /v1/transit-kms
+rgw_crypt_vault_auth = token
+rgw_crypt_vault_token_file = /etc/ceph/transhim.token
+
+rgw_crypt_sse_s3_backend = vault
+rgw_crypt_sse_s3_vault_secret_engine = transit
+rgw_crypt_sse_s3_vault_addr = https://transhim.example.com:8200
+rgw_crypt_sse_s3_vault_prefix = /v1/transit-sse-s3
+rgw_crypt_sse_s3_vault_auth = token
+rgw_crypt_sse_s3_vault_token_file = /etc/ceph/transhim.token
+```
+
+See [docs/rgw.md](docs/rgw.md) for the details and for what to know before going live.
+
 ### Decrypt cache
 
 Ceph RGW calls `decrypt` on every read of an encrypted object, including HeadObject and each part of a multipart upload, always with the same wrapped key. The decrypt cache answers those without calling the KMS:
@@ -96,6 +132,8 @@ $ make capture       # re-capture RGW's Transit requests into testdata/capture/
 ```
 
 `make integration` needs docker compose. The test (in `integration/`, a Go module of its own because it uses the AWS SDK) starts a transhim server at `127.0.0.1:8201`, where the RGW of `compose.yml` expects its Transit endpoint. Another Ceph release: `CEPH_IMAGE=quay.io/ceph/ceph:v19.2.7 make integration`.
+
+The AWS KMS example is tested against the [AWS Emulator](https://github.com/aws/aws-emulator); see [examples/awskms](examples/awskms).
 
 `make capture` needs docker compose, curl, jq, and the aws CLI. See [compat/capture.sh](compat/capture.sh) for its options (`CEPH_IMAGE`, `EMPTY_KEY_WRITES`, `CEPH_EXTRA_ARGS`).
 
