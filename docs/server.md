@@ -181,6 +181,35 @@ type Authorizer func(ctx context.Context, req AuthRequest) error
 
 `AuthRequest` has the operation, the mount ID, the key name, the token, and the TLS state. It does not say which S3 user is behind the request: RGW does not pass that on. What you can decide is what RGW as a whole may do.
 
+### Where the token comes from
+
+`AuthRequest.Token` is the value of the request's `X-Vault-Token` header, as in the Vault API, or `""` if there is none. transhim does not interpret it: there are no Vault tokens to issue or look up, and what a valid token is, is up to the authorizer. (`AuthRequest.Namespace` is the `X-Vault-Namespace` header, passed on the same way.)
+
+RGW reads the token from a file and sends it with every request:
+
+```ini
+[client.rgw]
+rgw_crypt_vault_auth = token
+rgw_crypt_vault_token_file = /etc/ceph/transhim.token
+
+rgw_crypt_sse_s3_vault_auth = token
+rgw_crypt_sse_s3_vault_token_file = /etc/ceph/transhim.token
+```
+
+```console
+$ openssl rand -hex 32 > /etc/ceph/transhim.token
+$ chown ceph:ceph /etc/ceph/transhim.token && chmod 600 /etc/ceph/transhim.token
+```
+
+- The file must be readable by the user RGW runs as and by nobody else, or RGW refuses to use it.
+- The server must expect the same value. The examples read it from a copy of that file (`-token-file`) and trim surrounding whitespace, since the file usually ends with a newline.
+- The two mounts can share a token or have one each. With one each, the authorizer can tell from the token which of RGW's two uses a request belongs to, and check that it matches `req.MountID`.
+- RGW sends the header twice with the same value; transhim uses the first.
+
+See [rgw.md](rgw.md) for the rest of RGW's settings.
+
+### An authorizer
+
 `transhim.StaticTokenAuthorizer(token)` allows everything to one token. A server usually wants more:
 
 ```go
