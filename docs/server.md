@@ -190,7 +190,9 @@ An `Authorizer` is called for every request, before the backend and before the d
 type Authorizer func(ctx context.Context, req AuthRequest) error
 ```
 
-`AuthRequest` has the operation, the mount ID, the key name, the token, and the TLS state. It does not say which S3 user is behind the request: RGW does not pass that on. What you can decide is what RGW as a whole may do.
+`AuthRequest` has the operation, the mount ID, the key name, the context, the token, and the TLS state. It does not say which S3 user is behind the request: RGW does not pass that on. What you can decide is what RGW as a whole may do.
+
+The authorizer runs after the request body was read and before anything in it is reported as wrong: a client that is refused gets a `403` whatever it sent.
 
 ### Where the token comes from
 
@@ -218,6 +220,23 @@ $ chown ceph:ceph /etc/ceph/transhim.token && chmod 600 /etc/ceph/transhim.token
 - RGW sends the header twice with the same value; transhim uses the first.
 
 See [rgw.md](rgw.md) for the rest of RGW's settings.
+
+### The context
+
+`AuthRequest.Context` is the decoded `context` of a datakey, encrypt, or decrypt request: the bytes that are bound into the ciphertext along with the mount ID and the key name. It is nil for key operations and when the request has none.
+
+RGW sends a JSON object that names the S3 object:
+
+```json
+{"aws:s3:arn":"arn:aws:s3::<owner>:<bucket>/<object>"}
+```
+
+How far that can be trusted depends on the mount:
+
+- **SSE-S3**: the context is RGW's own. RGW rejects a PutObject that brings an encryption context. An authorizer can tell the bucket and the object from it.
+- **SSE-KMS**: the S3 user can add entries with `x-amz-server-side-encryption-context`, and an `aws:s3:arn` entry there **replaces** RGW's. The user can name any object. Do not let the context decide which key an S3 user may use; a rule like "this key only for that bucket" cannot be enforced this way.
+
+In both cases it is worth logging; see the audit hook below.
 
 ### An authorizer
 
@@ -319,6 +338,7 @@ Choose the TTLs as the longest time you accept for such a revocation. A key name
 |---|---|---|
 | `WithMaxPlaintextSize` (mount) | 4096 bytes | your KMS encrypts less; only the `encrypt` endpoint is affected, which RGW does not use |
 | `WithMaxBodySize` | 1 MiB | rarely |
+| `WithBodyReadTimeout` | 10 s | rarely. It limits how long a client may take to send its body, which is read before the request is authorized; a client that is too slow gets `408` |
 | `RequireDeletionAllowed` (mount) | off | to refuse `DELETE keys/{name}` unless the client set `deletion_allowed` first, as Vault does. RGW sets it. The flag is kept in memory only |
 | `RejectUnmanagedKeyOps` (mount) | off | to answer key requests with `405` on a mount whose keys are provisioned by hand. Do not use it on a mount RGW uses for SSE-S3 |
 | `WithLogger` | `slog.Default()` | to send the server's own log elsewhere |
@@ -329,7 +349,7 @@ Choose the TTLs as the longest time you accept for such a revocation. A key name
 
 The Transit datakey API returns data keys in plaintext, so serve TLS and let only RGW reach the server.
 
-In the `http.Server`, set `ReadHeaderTimeout`. If you set `WriteTimeout`, make it longer than your slowest KMS call plus its retries: a response cut off by it reaches the S3 client as a `500`. On shutdown, give `Shutdown` at least that long as well.
+In the `http.Server`, set `ReadHeaderTimeout`. The server limits the time for the body itself (`WithBodyReadTimeout`) and lifts that limit, and one set by `ReadTimeout`, once the body is read, so that it does not cut off a slow KMS call. If you set `WriteTimeout`, make it longer than your slowest KMS call plus its retries: a response cut off by it reaches the S3 client as a `500`. On shutdown, give `Shutdown` at least that long as well.
 
 ### Health checks
 
@@ -357,6 +377,7 @@ Keep it cheap. A check that calls the KMS on every probe costs a KMS call each t
 func audit(ctx context.Context, ev transhim.AuditEvent) {
 	attrs := []any{
 		"op", string(ev.Op), "mount_id", ev.MountID, "key_name", ev.KeyName,
+		"context", string(ev.Context), // with RGW: the S3 object, as JSON
 		"status", ev.Status, "cache_hit", ev.CacheHit, "duration", ev.Duration,
 		"remote_addr", ev.RemoteAddr, "request_id", ev.RequestID,
 	}
@@ -369,7 +390,8 @@ func audit(ctx context.Context, ev transhim.AuditEvent) {
 
 - The hook runs synchronously and must not block. Hand events to a queue if the sink can be slow.
 - `ev.Err` is where the reason of a failure is: the KMS error your backend wrapped. The client only got the status.
-- Events and logs never contain key material, ciphertexts, or tokens. Key names are logged; with RGW they are KMS key IDs and bucket IDs.
+- `ev.Context` says which S3 object a request was for, also for requests that were refused or answered from the cache. With SSE-KMS it is what the S3 user claims (see "The context" above): a record, not proof.
+- Events never contain key material, ciphertexts, or tokens. The server's own log has none of these and no context either. Key names are logged; with RGW they are KMS key IDs and bucket IDs.
 - There is no metrics exporter. Count in the hook: requests by `Op`, `MountID`, and `Status`, the `Duration`, and the share of `CacheHit` among decrypts. Do not use the key name as a label: there is one per bucket.
 
 What to alert on: `5xx` answers (every one is a failed S3 request), a rising duration (RGW waits without limit), and `403` answers that you do not expect.
