@@ -13,7 +13,7 @@ What it does:
 - Binds every ciphertext to its mount, key name, and context, so that it cannot be decrypted under another one.
 - Offers per-bucket keys without one KMS key per bucket (the hierarchical backend), a decrypt cache for slow KMS services, an authorization hook, and an audit hook.
 
-What it is not: a Vault replacement, or a ready-made server. You write your own `main`; [examples/awskms](examples/awskms) is one for AWS KMS.
+What it is not: a Vault replacement, or a ready-made server. You write your own `main`; there are examples for [AWS KMS](examples/awskms) and [SAKURA Cloud KMS](examples/sakurakms).
 
 Documents:
 
@@ -21,6 +21,7 @@ Documents:
 - [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, how it reacts to failures, and where transhim differs from Vault
 - [docs/DESIGN.md](docs/DESIGN.md): design document
 - [examples/awskms](examples/awskms): an AWS KMS backend and an example server
+- [examples/sakurakms](examples/sakurakms): the same for SAKURA Cloud KMS, a KMS without a parameter for authenticated data
 
 ## Usage
 
@@ -133,7 +134,7 @@ $ make capture       # re-capture RGW's Transit requests into testdata/capture/
 
 `make integration` needs docker compose. The test (in `integration/`, a Go module of its own because it uses the AWS SDK) starts a transhim server at `127.0.0.1:8201`, where the RGW of `compose.yml` expects its Transit endpoint. Another Ceph release: `CEPH_IMAGE=quay.io/ceph/ceph:v19.2.7 make integration`.
 
-The AWS KMS example is tested against the [AWS Emulator](https://github.com/aws/aws-emulator); see [examples/awskms](examples/awskms).
+The AWS KMS example is tested against the [AWS Emulator](https://github.com/aws/aws-emulator), the SAKURA Cloud KMS example against [sakumock](https://github.com/sacloud/sakumock); see their READMEs.
 
 `make capture` needs docker compose, curl, jq, and the aws CLI. See [compat/capture.sh](compat/capture.sh) for its options (`CEPH_IMAGE`, `EMPTY_KEY_WRITES`, `CEPH_EXTRA_ARGS`).
 

@@ -27,6 +27,10 @@ updates:
         patterns:
           - "github.com/aws/aws-sdk-go-v2*"
           - "github.com/aws/smithy-go"
+  - package-ecosystem: gomod
+    directory: "/examples/sakurakms"
+    schedule:
+      interval: monthly
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

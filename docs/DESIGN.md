@@ -156,6 +156,7 @@ transhim/                 core (stdlib and golang.org/x only)
   keystore/memstore/      in-memory KeyStore (tests & dev only)
 examples/
   awskms/                 separate go.mod; AWS KMS backend + example main
+  sakurakms/              separate go.mod; SAKURA Cloud KMS backend + example main
   gcpkms/                 separate go.mod (optional, later)
 integration/              separate go.mod; acceptance test against Ceph RGW
 ```
@@ -460,6 +461,7 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 - `examples/awskms`: an AWS KMS backend implementing `Backend` + `DataKeyGenerator`. AAD maps to `EncryptionContext{"transhim-aad": hex(sha256(AAD))}`. The hash keeps the value at a fixed length regardless of the context size, so it cannot exceed the KMS encryption context limit. This mapping is part of the on-disk compatibility contract of the example backend. `KeyRef` is the key ARN returned by KMS; it is informational, because a client can change it. `Decrypt` names the KMS key that the key name resolves to, so KMS refuses a ciphertext of any other key. An empty plaintext is rejected with `ErrInvalidRequest`, since KMS encrypts 1 to 4096 bytes. The backend is tested against the AWS Emulator, including the conformance suite on both mounts. The example `main` mounts:
   - `/v1/transit-kms` (mount ID `rgw-kms`) → AWS backend, with key name resolved as `alias/rgw/{name}`
   - `/v1/transit-sse-s3` (mount ID `rgw-sse-s3`) → hierarchical backend (root = AWS backend with a fixed `rootKeyName`, store = memstore with a "DO NOT USE IN PROD" warning)
+- `examples/sakurakms`: a SAKURA Cloud KMS backend implementing `Backend`, with the same two mounts. That KMS has no parameter for additional authenticated data, so the backend binds the AAD itself: it encrypts `0x01 || sha256(AAD) || plaintext` and compares the hash after decrypting. This relies on the KMS ciphertext being authenticated (AES-256-GCM), and is part of the on-disk compatibility contract of the example backend. Key names are resolved through an explicit map to KMS resource IDs. It is tested against sakumock, including the conformance suite on both mounts.
 - The README includes the matching Ceph RGW configuration snippet; `docs/rgw.md` is the full guide.
 
 ## 12. Compatibility Verification Tasks (must be done during implementation)

@@ -69,7 +69,7 @@ RGW passes the key ID of an S3 request to the Transit endpoint as it is. It does
 
 Decide what a key name may reach. The usual ways:
 
-- Resolve names within a namespace of their own, so that only keys meant for RGW can be named. The AWS KMS example resolves `name` to the alias `alias/rgw/name`.
+- Resolve names within a namespace of their own, so that only keys meant for RGW can be named. The AWS KMS example resolves `name` to the alias `alias/rgw/name`; the SAKURA Cloud KMS example takes an explicit list of names.
 - Check the key name in the `Authorizer`. The request does not say which S3 user is asking, so this limits what RGW as a whole may use.
 
 RGW itself rejects key IDs containing `/`.
