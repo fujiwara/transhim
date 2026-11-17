@@ -6,7 +6,7 @@ import (
 )
 
 // AuditEvent describes one finished request. It never contains key material,
-// ciphertexts, tokens, or request bodies.
+// ciphertexts, or tokens, and of the request body only the context.
 type AuditEvent struct {
 	// Time is when the request arrived.
 	Time time.Time
@@ -16,6 +16,11 @@ type AuditEvent struct {
 	MountID string
 	// KeyName is the key the request named, or "" if it had no valid one.
 	KeyName string
+	// Context is the decoded "context" of a datakey, encrypt, or decrypt
+	// request, or nil. With Ceph RGW it names the S3 object the request is
+	// for; see AuthRequest.Context for how far that can be trusted. The hook
+	// must not modify it.
+	Context []byte
 	// CacheHit reports that a decrypt was answered from the decrypt cache.
 	CacheHit bool
 	// Duration is the time spent serving the request.

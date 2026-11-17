@@ -383,7 +383,7 @@ srv, err := transhim.NewServer(
 
 The mount ID is a positional argument of `Mount` rather than an option, so that omitting it is a compile error. `NewServer` validates it as described in §7.2.
 
-`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
+`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Context` (the decoded context of datakey, encrypt, and decrypt requests; the body is read before the authorizer runs, and body errors are reported after it), `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
 
 The authorizer returns an error wrapping `ErrPermissionDenied` to answer 403. Any other error also rejects the request and is mapped as in §6.8. `transhim.StaticTokenAuthorizer(token)` is provided for the common single-token setup (constant-time comparison; an empty token allows nothing).
 
@@ -453,7 +453,7 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 
 ## 10. Audit, Logging, Observability
 
-- `AuditEvent{Time, Op, MountID, KeyName, CacheHit, Duration, Status, Err, RemoteAddr, RequestID}` is passed to the hook synchronously after each request, once the answer is written. Every request produces an event, including rejected ones and those that match no mount (their `Op`, `MountID`, or `KeyName` are empty). `Err` carries backend error details that the client does not get. The hook must not block; this is documented. No async helper is provided in v1.
+- `AuditEvent{Time, Op, MountID, KeyName, Context, CacheHit, Duration, Status, Err, RemoteAddr, RequestID}` is passed to the hook synchronously after each request, once the answer is written. Every request produces an event, including rejected ones and those that match no mount (their `Op`, `MountID`, or `KeyName` are empty). `Err` carries backend error details that the client does not get. The hook must not block; this is documented. No async helper is provided in v1.
 - Logging uses `log/slog`. **Never log** plaintext, ciphertext, tokens, or request bodies. Key names may be logged.
 - Metrics: no built-in exporter in v1. The audit hook is sufficient to build them.
 

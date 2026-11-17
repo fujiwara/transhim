@@ -226,6 +226,8 @@ func parseOp(method, rest string) (Op, string, error) {
 
 // request is the state of one request being served.
 type request struct {
+	// context is the decoded context of the request body, or nil.
+	context  []byte
 	id       string
 	op       Op
 	mount    *mount
@@ -274,6 +276,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Time:       start,
 			Op:         req.op,
 			KeyName:    req.keyName,
+			Context:    req.context,
 			CacheHit:   req.cacheHit,
 			Duration:   time.Since(start),
 			Status:     status,
@@ -313,11 +316,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 	}
 	req.keyName = name
 
+	// The body is read before the request is authorized, because the
+	// authorizer is told the context. A body that cannot be used is reported
+	// only after that: a client that is not allowed in gets a 403 whatever it
+	// sent.
+	body, bodyErr := s.readBody(w, r)
+	if bodyErr == nil {
+		req.context, bodyErr = requestContext(op, body)
+	}
 	if s.authorizer != nil {
 		err := s.authorizer(r.Context(), AuthRequest{
 			Op:         op,
 			MountID:    m.id,
 			KeyName:    name,
+			Context:    bytes.Clone(req.context),
 			Token:      r.Header.Get("X-Vault-Token"),
 			Namespace:  r.Header.Get("X-Vault-Namespace"),
 			TLS:        r.TLS,
@@ -327,10 +339,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 			return nil, err
 		}
 	}
-
-	body, err := s.readBody(w, r)
-	if err != nil {
-		return nil, err
+	if bodyErr != nil {
+		return nil, bodyErr
 	}
 	switch op {
 	case OpDataKey:
@@ -374,13 +384,26 @@ func decodeBody(body []byte, v any) error {
 	return nil
 }
 
-// decodeContext decodes the base64 "context" field. An absent and an empty
-// context are the same.
-func decodeContext(s string) ([]byte, error) {
-	if s == "" {
+// requestContext returns the decoded "context" field of a datakey, encrypt, or
+// decrypt request. The other operations have none. An absent and an empty
+// context are the same: nil.
+//
+// This is the one place where the context is taken from the body, so that the
+// authorizer and the audit hook see exactly what is bound into the ciphertext.
+func requestContext(op Op, body []byte) ([]byte, error) {
+	if op != OpDataKey && op != OpEncrypt && op != OpDecrypt {
 		return nil, nil
 	}
-	b, err := base64.StdEncoding.DecodeString(s)
+	var in struct {
+		Context string `json:"context"`
+	}
+	if err := decodeBody(body, &in); err != nil {
+		return nil, err
+	}
+	if in.Context == "" {
+		return nil, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(in.Context)
 	if err != nil {
 		return nil, badRequest("failed to base64-decode context")
 	}
@@ -388,8 +411,7 @@ func decodeContext(s string) ([]byte, error) {
 }
 
 type dataKeyBody struct {
-	Context string `json:"context"`
-	Bits    *int   `json:"bits"`
+	Bits *int `json:"bits"`
 }
 
 type dataKeyData struct {
@@ -410,10 +432,7 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 	if bits != 128 && bits != 256 && bits != 512 {
 		return nil, badRequest("invalid bit length")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	m := req.mount
 	aad := buildAAD(m.id, req.keyName, keyContext)
 	size := bits / 8
@@ -424,6 +443,7 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 
 	var plaintext []byte
 	var wk WrappedKey
+	var err error
 	if g, ok := m.backend.(DataKeyGenerator); ok {
 		plaintext, wk, err = g.GenerateDataKey(ctx, DataKeyRequest{
 			MountID: m.id, KeyName: req.keyName, Bytes: size, AAD: aad,
@@ -457,7 +477,6 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 
 type encryptBody struct {
 	Plaintext  *string `json:"plaintext"`
-	Context    string  `json:"context"`
 	KeyVersion int     `json:"key_version"`
 }
 
@@ -487,10 +506,7 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 	if len(plaintext) > m.maxPlaintextSize {
 		return nil, badRequest("plaintext too large")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	wk, err := m.backend.Encrypt(ctx, EncryptRequest{
 		MountID:   m.id,
 		KeyName:   req.keyName,
@@ -509,7 +525,6 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 
 type decryptBody struct {
 	Ciphertext *string `json:"ciphertext"`
-	Context    string  `json:"context"`
 }
 
 type decryptData struct {
@@ -524,10 +539,7 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	if in.Ciphertext == nil {
 		return nil, badRequest("missing ciphertext to decrypt")
 	}
-	keyContext, err := decodeContext(in.Context)
-	if err != nil {
-		return nil, err
-	}
+	keyContext := req.context
 	wk, err := decodeEnvelope(*in.Ciphertext)
 	if err != nil {
 		return nil, err

@@ -31,6 +31,17 @@ type AuthRequest struct {
 	MountID string
 	// KeyName is the key the operation uses.
 	KeyName string
+	// Context is the decoded "context" of a datakey, encrypt, or decrypt
+	// request: the bytes that are bound into the ciphertext along with the
+	// mount ID and the key name. It is nil if the request has none, and for
+	// the key operations, which never have one.
+	//
+	// The client chooses it. Ceph RGW sends a JSON object that names the S3
+	// object: {"aws:s3:arn":"arn:aws:s3::<owner>:<bucket>/<object>"}. With
+	// SSE-S3 that is RGW's own statement. With SSE-KMS the S3 user can add
+	// entries and replace the ARN with any other, so it must not be what
+	// decides which key that user may use (docs/compat.md).
+	Context []byte
 	// Token is the first X-Vault-Token header value, or "".
 	Token string
 	// Namespace is the X-Vault-Namespace header value. The server does not
@@ -47,6 +58,10 @@ type AuthRequest struct {
 // it, and an error wrapping ErrPermissionDenied to answer 403. Any other error
 // also rejects the request, with the status its kind maps to (for example 502
 // for ErrUpstream, 500 otherwise).
+//
+// It is called after the request body was read (up to the size limit) and
+// before anything in it is reported as wrong, so a client that is refused
+// learns nothing about its body.
 //
 // Clients such as Ceph RGW do not check whether an S3 user may use a given key
 // name. If that matters, check it here. A Backend can restrict which keys a

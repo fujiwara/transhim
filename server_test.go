@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -512,17 +513,36 @@ func TestAuthorizer(t *testing.T) {
 	}
 	e.do(http.MethodPost, "/v1/transit-sse-s3/encrypt/key1", `{"plaintext":""}`)
 	e.do(http.MethodPost, "/v1/transit-sse-s3/decrypt/tenant%24user", `{}`)
+	// the context reaches the authorizer decoded, for the operations that have one
+	const s3Context = `{"aws:s3:arn":"arn:aws:s3::owner:bucket/object"}`
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": rgwContext, "ciphertext": dk.str("ciphertext")}))
+	e.do(http.MethodPost, "/v1/transit-kms/encrypt/key1", jsonBody(map[string]any{"context": rgwContext, "plaintext": ""}))
+	e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":""}`)
+	// a key operation has no context, whatever its body says
+	e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b1", jsonBody(map[string]any{"context": rgwContext}))
+	// a body that cannot be used is reported after the authorizer had its say
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":"***"}`), 400, "failed to base64-decode context")
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{`), 400, "failed to decode JSON input")
 
+	const addr = "192.0.2.1:1234"
 	want := []transhim.AuthRequest{
-		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: "tok", Namespace: "ns1", RemoteAddr: "192.0.2.1:1234"},
-		{Op: transhim.OpEncrypt, MountID: "sse", KeyName: "key1", Token: testToken, RemoteAddr: "192.0.2.1:1234"},
-		{Op: transhim.OpDecrypt, MountID: "sse", KeyName: "tenant$user", Token: testToken, RemoteAddr: "192.0.2.1:1234"},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: "tok", Namespace: "ns1", RemoteAddr: addr},
+		{Op: transhim.OpEncrypt, MountID: "sse", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDecrypt, MountID: "sse", KeyName: "tenant$user", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDecrypt, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpEncrypt, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpKeyCreate, MountID: "sse", KeyName: "b1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("authorizer called %d times, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("auth request %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -540,8 +560,39 @@ func TestAuthorizer(t *testing.T) {
 		authErr = tt.err
 		e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", ""), tt.status, tt.msg)
 	}
-	if n := e.backend.Calls(transhimtest.OpEncrypt); n != 2 {
-		t.Errorf("backend called %d times, want 2", n)
+	if n := e.backend.Calls(transhimtest.OpEncrypt); n != 5 {
+		t.Errorf("backend called %d times, want 5", n)
+	}
+}
+
+// What the authorizer does to the context it was given does not change what is
+// bound into the ciphertext.
+func TestAuthorizerCannotChangeContext(t *testing.T) {
+	e := newEnv(t, transhim.WithAuthorizer(func(_ context.Context, req transhim.AuthRequest) error {
+		for i := range req.Context {
+			req.Context[i] = 'x'
+		}
+		return nil
+	}))
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	if dk.status != http.StatusOK {
+		t.Fatalf("datakey: %d %q", dk.status, dk.body)
+	}
+	r := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": rgwContext, "ciphertext": dk.str("ciphertext")}))
+	if r.status != http.StatusOK || r.str("plaintext") != dk.str("plaintext") {
+		t.Errorf("decrypt: %d %q", r.status, r.body)
+	}
+	other := b64(strings.Repeat("x", len(`{"aws:s3:arn":"arn:aws:s3::owner:bucket/object"}`)))
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": other, "ciphertext": dk.str("ciphertext")})), 400, "invalid ciphertext")
+}
+
+// A client that is not let in learns nothing about its body: not that it was
+// too large, and not that it was malformed.
+func TestUnauthorizedBody(t *testing.T) {
+	e := newEnv(t, transhim.WithMaxBodySize(64))
+	for _, body := range []string{`{`, `{"context":"***"}`, `{"context":"` + strings.Repeat("A", 64) + `"}`} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", strings.NewReader(body))
+		e.wantError(e.send(req), 403, "permission denied")
 	}
 }
 
