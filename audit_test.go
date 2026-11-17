@@ -91,9 +91,52 @@ func TestAuditHook(t *testing.T) {
 	if !errors.Is(events[3].Err, transhim.ErrKeyNotFound) {
 		t.Errorf("event 3: Err = %v, want ErrKeyNotFound", events[3].Err)
 	}
+	for i, ev := range events {
+		if ev.Context != nil {
+			t.Errorf("event %d: Context = %q, want none", i, ev.Context)
+		}
+	}
 	// the request ID is the one the client got
 	if !strings.Contains(string(dk.body), events[0].RequestID) {
 		t.Errorf("request_id %q is not in the response %q", events[0].RequestID, dk.body)
+	}
+}
+
+// The context names what a request is for (with Ceph RGW, the S3 object), also
+// when the request is refused or answered from the cache.
+func TestAuditContext(t *testing.T) {
+	var events []transhim.AuditEvent
+	e := newEnv(t, cacheOption(false), transhim.WithAuditHook(func(_ context.Context, ev transhim.AuditEvent) {
+		events = append(events, ev)
+	}))
+	body := jsonBody(map[string]any{"context": rgwContext})
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", body)
+	decBody := jsonBody(map[string]any{"context": rgwContext, "ciphertext": dk.str("ciphertext")})
+	e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", decBody)
+	e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", decBody) // cache hit
+	e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/nokey", body)
+	e.send(httptest.NewRequest(http.MethodPost, "/v1/transit-kms/decrypt/key1", strings.NewReader(decBody))) // no token
+	e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":"***"}`)
+	e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b1", body)
+
+	const s3Context = `{"aws:s3:arn":"arn:aws:s3::owner:bucket/object"}`
+	wants := []struct {
+		status  int
+		context string
+	}{
+		{200, s3Context}, {200, s3Context}, {200, s3Context}, {400, s3Context}, {403, s3Context},
+		{400, ""}, {204, ""},
+	}
+	if len(events) != len(wants) {
+		t.Fatalf("got %d events, want %d", len(events), len(wants))
+	}
+	for i, w := range wants {
+		if ev := events[i]; ev.Status != w.status || string(ev.Context) != w.context {
+			t.Errorf("event %d: status %d, Context %q; want %d, %q", i, ev.Status, ev.Context, w.status, w.context)
+		}
+	}
+	if !events[2].CacheHit {
+		t.Error("event 2 is not a cache hit")
 	}
 }
 

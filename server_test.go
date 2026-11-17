@@ -1,19 +1,24 @@
 package transhim_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fujiwara/transhim"
 	"github.com/fujiwara/transhim/transhimtest"
@@ -512,17 +517,39 @@ func TestAuthorizer(t *testing.T) {
 	}
 	e.do(http.MethodPost, "/v1/transit-sse-s3/encrypt/key1", `{"plaintext":""}`)
 	e.do(http.MethodPost, "/v1/transit-sse-s3/decrypt/tenant%24user", `{}`)
+	// the context reaches the authorizer decoded, for the operations that have one
+	const s3Context = `{"aws:s3:arn":"arn:aws:s3::owner:bucket/object"}`
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": rgwContext, "ciphertext": dk.str("ciphertext")}))
+	e.do(http.MethodPost, "/v1/transit-kms/encrypt/key1", jsonBody(map[string]any{"context": rgwContext, "plaintext": ""}))
+	e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":""}`)
+	// base64 for nothing is no context either: it binds like an absent one
+	e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":"\r\n"}`)
+	// a key operation has no context, whatever its body says
+	e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b1", jsonBody(map[string]any{"context": rgwContext}))
+	// a body that cannot be used is reported after the authorizer had its say
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{"context":"***"}`), 400, "failed to base64-decode context")
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", `{`), 400, "failed to decode JSON input")
 
+	const addr = "192.0.2.1:1234"
 	want := []transhim.AuthRequest{
-		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: "tok", Namespace: "ns1", RemoteAddr: "192.0.2.1:1234"},
-		{Op: transhim.OpEncrypt, MountID: "sse", KeyName: "key1", Token: testToken, RemoteAddr: "192.0.2.1:1234"},
-		{Op: transhim.OpDecrypt, MountID: "sse", KeyName: "tenant$user", Token: testToken, RemoteAddr: "192.0.2.1:1234"},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: "tok", Namespace: "ns1", RemoteAddr: addr},
+		{Op: transhim.OpEncrypt, MountID: "sse", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDecrypt, MountID: "sse", KeyName: "tenant$user", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDecrypt, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpEncrypt, MountID: "kms", KeyName: "key1", Context: []byte(s3Context), Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpKeyCreate, MountID: "sse", KeyName: "b1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
+		{Op: transhim.OpDataKey, MountID: "kms", KeyName: "key1", Token: testToken, RemoteAddr: addr},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("authorizer called %d times, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("auth request %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -540,8 +567,39 @@ func TestAuthorizer(t *testing.T) {
 		authErr = tt.err
 		e.wantError(e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", ""), tt.status, tt.msg)
 	}
-	if n := e.backend.Calls(transhimtest.OpEncrypt); n != 2 {
-		t.Errorf("backend called %d times, want 2", n)
+	if n := e.backend.Calls(transhimtest.OpEncrypt); n != 6 {
+		t.Errorf("backend called %d times, want 6", n)
+	}
+}
+
+// What the authorizer does to the context it was given does not change what is
+// bound into the ciphertext.
+func TestAuthorizerCannotChangeContext(t *testing.T) {
+	e := newEnv(t, transhim.WithAuthorizer(func(_ context.Context, req transhim.AuthRequest) error {
+		for i := range req.Context {
+			req.Context[i] = 'x'
+		}
+		return nil
+	}))
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", jsonBody(map[string]any{"context": rgwContext}))
+	if dk.status != http.StatusOK {
+		t.Fatalf("datakey: %d %q", dk.status, dk.body)
+	}
+	r := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": rgwContext, "ciphertext": dk.str("ciphertext")}))
+	if r.status != http.StatusOK || r.str("plaintext") != dk.str("plaintext") {
+		t.Errorf("decrypt: %d %q", r.status, r.body)
+	}
+	other := b64(strings.Repeat("x", len(`{"aws:s3:arn":"arn:aws:s3::owner:bucket/object"}`)))
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", jsonBody(map[string]any{"context": other, "ciphertext": dk.str("ciphertext")})), 400, "invalid ciphertext")
+}
+
+// A client that is not let in learns nothing about its body: not that it was
+// too large, and not that it was malformed.
+func TestUnauthorizedBody(t *testing.T) {
+	e := newEnv(t, transhim.WithMaxBodySize(64))
+	for _, body := range []string{`{`, `{"context":"***"}`, `{"context":"` + strings.Repeat("A", 64) + `"}`} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", strings.NewReader(body))
+		e.wantError(e.send(req), 403, "permission denied")
 	}
 }
 
@@ -668,6 +726,7 @@ func TestNewServerErrors(t *testing.T) {
 		"nil authorizer":        {transhim.Mount("/v1/transit", "m", fb), transhim.WithAuthorizer(nil)},
 		"nil logger":            {transhim.Mount("/v1/transit", "m", fb), auth, transhim.WithLogger(nil)},
 		"zero body size":        {transhim.Mount("/v1/transit", "m", fb), auth, transhim.WithMaxBodySize(0)},
+		"zero body timeout":     {transhim.Mount("/v1/transit", "m", fb), auth, transhim.WithBodyReadTimeout(0)},
 		"empty mount ID":        {transhim.Mount("/v1/transit", "", fb), auth},
 		"NUL in mount ID":       {transhim.Mount("/v1/transit", "a\x00b", fb), auth},
 		"control in mount ID":   {transhim.Mount("/v1/transit", "a\nb", fb), auth},
@@ -745,4 +804,66 @@ func TestConcurrentRequests(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// A client that sends its body slowly is answered when the time limit is up:
+// with a 403 if it is not let in, so that it cannot keep a connection busy
+// before it is authorized.
+func TestBodyReadTimeout(t *testing.T) {
+	e := newEnv(t, transhim.WithBodyReadTimeout(200*time.Millisecond))
+	srv := httptest.NewServer(e.handler)
+	t.Cleanup(srv.Close)
+
+	// stall sends a request that announces more body than it delivers and
+	// returns the status line of the answer.
+	stall := func(t *testing.T, token string) string {
+		t.Helper()
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(conn, "POST /v1/transit-kms/datakey/plaintext/key1 HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n")
+		if token != "" {
+			fmt.Fprintf(conn, "X-Vault-Token: %s\r\n", token)
+		}
+		fmt.Fprint(conn, "\r\n{")
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			t.Fatalf("no answer to a stalled request: %v", err)
+		}
+		return strings.TrimSpace(line)
+	}
+	if got := stall(t, ""); got != "HTTP/1.1 403 Forbidden" {
+		t.Errorf("stalled request without a token: %q, want 403", got)
+	}
+	if got := stall(t, testToken); got != "HTTP/1.1 408 Request Timeout" {
+		t.Errorf("stalled request with a token: %q, want 408", got)
+	}
+}
+
+// The time limit for the body does not apply to what follows: a backend call
+// that takes longer is not cut off.
+func TestBodyReadTimeoutEndsWithBody(t *testing.T) {
+	e := newEnv(t, transhim.WithBodyReadTimeout(100*time.Millisecond))
+	srv := httptest.NewServer(e.handler)
+	t.Cleanup(srv.Close)
+	e.backend.SetDelay(500 * time.Millisecond) // ends early if the request's context does
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/v1/transit-kms/datakey/plaintext/key1", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Vault-Token", testToken)
+	start := time.Now()
+	res, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK || time.Since(start) < 500*time.Millisecond {
+		body, _ := io.ReadAll(res.Body)
+		t.Errorf("slow backend call: %d %q after %v, want 200 after the backend's delay", res.StatusCode, body, time.Since(start))
+	}
 }

@@ -125,7 +125,7 @@ It is off by default. It holds plaintext data keys in memory, so **the TTL is th
 
 ### Audit
 
-`transhim.WithAuditHook(fn)` calls `fn` with an `AuditEvent` (operation, mount ID, key name, status, error, cache hit, duration, peer address, request ID) after every request. The hook runs synchronously and must not block. Events never contain key material, ciphertexts, or tokens.
+`transhim.WithAuditHook(fn)` calls `fn` with an `AuditEvent` (operation, mount ID, key name, context, status, error, cache hit, duration, peer address, request ID) after every request. The hook runs synchronously and must not block. Events never contain key material, ciphertexts, or tokens. With Ceph RGW the context names the S3 object a request is for; with SSE-KMS the S3 user can change it (see [docs/compat.md](docs/compat.md)), so it is for the record, not for authorization.
 
 ## Development
 
