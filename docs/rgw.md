@@ -89,7 +89,7 @@ On reef and squid, this deletion only works because transhim answers key request
 
 ### The `KeyStore` is as important as the data
 
-Every SSE-S3 object depends on its bucket's intermediate key in the `KeyStore`. Losing the store loses all of them. The keys in it are wrapped by the KMS root key, so the store does not have to be secret, but it must be durable and backed up. `keystore/memstore` is for tests only.
+Every SSE-S3 object depends on its bucket's intermediate key in the `KeyStore`. Losing the store loses all of them. The keys in it are wrapped by the KMS root key, so the store does not have to be secret, but it must be durable and backed up. `keystore/memstore` is for tests only. [examples/sqlkeystore](../examples/sqlkeystore) is a store on PostgreSQL or SQLite to start from, and `transhimtest.RunKeyStoreConformance` checks a store of your own.
 
 The root key name and the mount ID are bound into the stored keys. Changing either makes the store unusable.
 

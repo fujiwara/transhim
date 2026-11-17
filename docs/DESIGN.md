@@ -157,6 +157,7 @@ transhim/                 core (stdlib and golang.org/x only)
 examples/
   awskms/                 separate go.mod; AWS KMS backend + example main
   sakurakms/              separate go.mod; SAKURA Cloud KMS backend + example main
+  sqlkeystore/            separate go.mod; KeyStore on PostgreSQL or SQLite
   gcpkms/                 separate go.mod (optional, later)
 integration/              separate go.mod; acceptance test against Ceph RGW
 ```
@@ -430,7 +431,7 @@ Behavior:
 - Eviction is local to the process. When several transhim instances share a KeyStore, the other instances keep the unwrapped intermediate key until its TTL expires, so crypto-shredding completes only after at most that TTL (plus the decrypt cache TTL, §9). Documentation must state this.
 - There is no lazy creation in v1: `Encrypt` on a missing key returns `ErrKeyNotFound`. RGW always calls `keys/` before the first `datakey` (verified), so an `AutoCreate` option is not needed and is left out.
 
-Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres, etcd, a cloud database) are the user's responsibility. Document the interface contract clearly.
+Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres, etcd, a cloud database) are the user's responsibility. The contract is documented on the interface and checked by `transhimtest.RunKeyStoreConformance`, which users run against their own store. `examples/sqlkeystore` is an example store on PostgreSQL or SQLite through `database/sql`; it is a module of its own because its tests need database drivers.
 
 ---
 

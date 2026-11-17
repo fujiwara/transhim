@@ -22,6 +22,7 @@ Documents:
 - [docs/DESIGN.md](docs/DESIGN.md): design document
 - [examples/awskms](examples/awskms): an AWS KMS backend and an example server
 - [examples/sakurakms](examples/sakurakms): the same for SAKURA Cloud KMS, a KMS without a parameter for authenticated data
+- [examples/sqlkeystore](examples/sqlkeystore): a durable `KeyStore` for the per-bucket keys, on PostgreSQL or SQLite
 
 ## Usage
 
@@ -79,7 +80,7 @@ sseS3, err := hierarchical.New(
 transhim.Mount("/v1/transit-sse-s3", "rgw-sse-s3", sseS3)
 ```
 
-- **The `KeyStore` is state you must not lose.** A lost entry makes every object encrypted with that key unreadable. The stored keys are wrapped, so the store need not be secret, but it must be durable. `keystore/memstore` is for tests and development only.
+- **The `KeyStore` is state you must not lose.** A lost entry makes every object encrypted with that key unreadable. The stored keys are wrapped, so the store need not be secret, but it must be durable. `keystore/memstore` is for tests and development only; [examples/sqlkeystore](examples/sqlkeystore) is a store on PostgreSQL or SQLite to start from. `transhimtest.RunKeyStoreConformance` checks a store of your own against the contract.
 - **The root key name is permanent**, like the mount ID: both are bound into the stored keys.
 - Deleting a key deletes its intermediate key, which makes the bucket's data unreadable (crypto-shredding). This is best effort: RGW does not always delete the key of a deleted bucket (see [docs/compat.md](docs/compat.md)), so orphaned keys can stay in the store.
 - Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). Loading one costs a `KeyStore` read and a KMS call; requests for the same key that arrive meanwhile wait for that load instead of starting their own. With several transhim instances sharing a store, a key deleted through one instance stays usable through the others until that TTL has passed.

@@ -21,6 +21,9 @@ var ErrKeyExists = errors.New("key already exists")
 //
 // Implementations must be safe for concurrent use, also by several processes
 // if several server instances share the store.
+//
+// transhimtest.RunKeyStoreConformance checks an implementation against this
+// contract.
 type KeyStore interface {
 	// Get returns the key stored for (mountID, keyName). If there is none, it
 	// returns an error wrapping transhim.ErrKeyNotFound.
