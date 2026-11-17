@@ -31,6 +31,10 @@ updates:
     directory: "/examples/sakurakms"
     schedule:
       interval: monthly
+  - package-ecosystem: gomod
+    directory: "/examples/sqlkeystore"
+    schedule:
+      interval: monthly
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

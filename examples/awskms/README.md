@@ -37,7 +37,7 @@ $ go run ./cmd/transhim-awskms -listen :8200 -token-file token \
 
 The matching RGW configuration is in [docs/rgw.md](../../docs/rgw.md).
 
-**The per-bucket keys are kept in memory** (`keystore/memstore`). When the process ends, every SSE-S3 object becomes unreadable. Before storing anything you need, replace it with a durable `hierarchical.KeyStore` of your own.
+**The per-bucket keys are kept in memory** (`keystore/memstore`). When the process ends, every SSE-S3 object becomes unreadable. Before storing anything you need, replace it with a durable `hierarchical.KeyStore`; [examples/sqlkeystore](../sqlkeystore) is one on PostgreSQL or SQLite.
 
 ## Tests
 
