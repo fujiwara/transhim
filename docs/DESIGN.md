@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1 and M2 implemented)
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1–M3 implemented)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -401,7 +401,7 @@ type StoredKey struct {
     CreatedAt time.Time
 }
 
-func New(root transhim.Backend, rootKeyName string, store KeyStore, opts ...Option) *Backend
+func New(root transhim.Backend, rootKeyName string, store KeyStore, opts ...Option) (*Backend, error)
 ```
 
 `PutIfAbsent` must be atomic. If a key already exists for `(mountID, keyName)`, it must leave the stored key untouched and return `ErrKeyExists`. The KeyStore has no listing method in v1; if one is needed later (admin CLI, garbage collection of orphaned keys), it will be added as a separate optional interface.
@@ -419,9 +419,10 @@ Root key usage:
 
 Behavior:
 
-- `CreateKey`: generate a 32-byte intermediate key, wrap it with root `Encrypt` as described above, and call `PutIfAbsent`. On `ErrKeyExists`, discard the generated key and return success (the existing key wins). This makes `CreateKey` idempotent and safe under concurrent creation.
+- `CreateKey`: look the key up in the KeyStore first and return success if it exists, without a root call (RGW re-creates existing keys after `DeleteBucketEncryption`). Otherwise generate a 32-byte intermediate key, wrap it with root `Encrypt` as described above, and call `PutIfAbsent`. On `ErrKeyExists`, discard the generated key and return success (the existing key wins). This makes `CreateKey` idempotent and safe under concurrent creation.
 - `Encrypt`/`Decrypt`: load and unwrap the intermediate key, then apply AES-256-GCM locally with a random 12-byte nonce, `Blob = nonce || ct`, and the AAD from the core. `KeyRef` is set to `"h1"`.
-- Unwrapped intermediate keys are cached in memory, keyed by `(mountID, keyName)`, with their own TTL. They are evicted on `DeleteKey`.
+- Unwrapped intermediate keys are cached in memory, keyed by `(mountID, keyName)`, with their own TTL (`WithKeyCacheTTL`, default 5 minutes, 0 disables). They are evicted on `DeleteKey`, also when the KeyStore reports a failure. A key that was being loaded while a deletion happened is not cached. A key that `CreateKey` just stored is cached, so the `datakey` call that RGW sends next needs no root call.
+- Root backend errors are passed on only if they are `ErrUpstream`, `ErrPermissionDenied`, or a context error. Anything else (the root key is missing, a stored key does not unwrap) becomes an internal error: it is not the client's key or ciphertext that is wrong.
 - `DeleteKey`: delete from the KeyStore and evict from the cache. This is the crypto-shredding point.
 - Eviction is local to the process. When several transhim instances share a KeyStore, the other instances keep the unwrapped intermediate key until its TTL expires, so crypto-shredding completes only after at most that TTL (plus the decrypt cache TTL, §9). Documentation must state this.
 - There is no lazy creation in v1: `Encrypt` on a missing key returns `ErrKeyNotFound`. RGW always calls `keys/` before the first `datakey` (verified), so an `AutoCreate` option is not needed and is left out.
@@ -494,7 +495,7 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 0. **M0 – Capture** (done): record the real requests of Ceph RGW (SSE-KMS and SSE-S3) against Vault or OpenBao, covering §12 items 1, 2, 4, and 6. These results determine the exact v1 endpoint set (see the v1 scope rule in §2), the API shape, the "key not found" response, and whether lazy key creation is needed, so they come before M1. Record them in `docs/compat.md`.
 1. **M1 – Core** (done): server, routing, envelope, AAD, error mapping, `datakey/plaintext`, `decrypt`, `encrypt`, authorizer, FakeBackend, unit tests.
 2. **M2 – Key ops** (done): `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
-3. **M3 – Hierarchical backend** + memstore + tests.
+3. **M3 – Hierarchical backend** (done) + memstore + tests.
 4. **M4 – RGW acceptance**: golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
 5. **M5 – Examples & docs**: AWS KMS example, RGW configuration guide, README.
 

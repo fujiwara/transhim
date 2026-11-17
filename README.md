@@ -4,7 +4,7 @@ A Go framework for building HashiCorp Vault Transit–compatible API servers who
 
 The first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
 
-**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. Still missing: the hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) and the acceptance test against a real RGW. The API may change until the first release.
+**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. The hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) is implemented as well. Still missing: the acceptance test against a real RGW, and the AWS KMS example. The API may change until the first release.
 
 - [docs/DESIGN.md](docs/DESIGN.md): design document
 - [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, and how the reference implementation answers
@@ -45,6 +45,25 @@ Things to know:
 - A backend may also implement `DataKeyGenerator` if its KMS has a native "generate data key" call.
 - A backend may implement `KeyLifecycle` to create and delete keys when the client asks (Ceph RGW does, for SSE-S3: one key per bucket). Without it, those requests succeed and do nothing, and keys are expected to exist in the KMS.
 - `transhimtest.FakeBackend` is an in-memory backend for tests.
+
+### Per-bucket keys: the hierarchical backend
+
+For SSE-S3, Ceph RGW creates one key per bucket and deletes it with the bucket. Creating a KMS key per bucket is usually too slow and too expensive. `hierarchical.Backend` keeps one root key in the KMS and gives every key name a random intermediate key, stored wrapped by the root key in a `KeyStore` you provide:
+
+```go
+sseS3, err := hierarchical.New(
+	&myKMS{},          // root backend
+	"transhim-root",   // the only key name the root backend ever sees
+	store,             // your hierarchical.KeyStore
+)
+// ...
+transhim.Mount("/v1/transit-sse-s3", "rgw-sse-s3", sseS3)
+```
+
+- **The `KeyStore` is state you must not lose.** A lost entry makes every object encrypted with that key unreadable. The stored keys are wrapped, so the store need not be secret, but it must be durable. `keystore/memstore` is for tests and development only.
+- **The root key name is permanent**, like the mount ID: both are bound into the stored keys.
+- Deleting a key deletes its intermediate key, which makes the bucket's data unreadable (crypto-shredding). This is best effort: RGW does not always delete the key of a deleted bucket (see [docs/compat.md](docs/compat.md)), so orphaned keys can stay in the store.
+- Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). With several transhim instances sharing a store, a key deleted through one instance stays usable through the others until that TTL has passed.
 
 ### Decrypt cache
 
