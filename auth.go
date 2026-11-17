@@ -15,6 +15,12 @@ const (
 	OpDataKey Op = "datakey"
 	OpEncrypt Op = "encrypt"
 	OpDecrypt Op = "decrypt"
+	// OpKeyCreate is POST keys/{name}.
+	OpKeyCreate Op = "key_create"
+	// OpKeyConfig is POST keys/{name}/config.
+	OpKeyConfig Op = "key_config"
+	// OpKeyDelete is DELETE keys/{name}.
+	OpKeyDelete Op = "key_delete"
 )
 
 // AuthRequest describes a request to an Authorizer.

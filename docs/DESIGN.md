@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1 implemented)
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); M1 and M2 implemented)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -223,7 +223,7 @@ Behavior: decode the envelope. Verify that the key name and context binding matc
 The body may contain `type`, `exportable`, `derived`, etc. These are ignored, except that `exportable: true` is **rejected** with 400.
 
 - If the backend implements `KeyLifecycle`, call `CreateKey`. It must be idempotent: an existing key returns success.
-- Otherwise, return 204 without doing anything. Keys are assumed to be pre-provisioned in the KMS. This is configurable: `RejectUnmanagedKeyOps` returns 405 instead.
+- Otherwise, return 204 without doing anything. Keys are assumed to be pre-provisioned in the KMS. This is configurable: the mount option `RejectUnmanagedKeyOps` returns 405 instead, for create, config, and delete alike.
 
 Response: 204 No Content with an **empty body**. This is deliberate and differs from Vault and OpenBao, which answer 200 with the key's metadata: RGW expects an empty response here and logs an error otherwise (compat.md).
 
@@ -241,9 +241,10 @@ If the backend implements `KeyDescriber`, use its information. Otherwise, report
 
 ### 6.6 `POST {prefix}/keys/{name}/config` and `DELETE {prefix}/keys/{name}`
 
-- `config`: accept `deletion_allowed` (bool) and ignore all other fields. Record `deletion_allowed` in memory per key name (it is a best-effort safety latch; it does not need to be durable). Respond 204 with an **empty body**. This is required, not cosmetic: RGW before tentacle treats a non-empty `config` response as a failure and then never sends the `DELETE` (compat.md). `config` on a key the backend does not know also answers 204, since transhim cannot tell in general.
-- `DELETE`: if the backend implements `KeyLifecycle`, call `DeleteKey`. Deletion is idempotent: a missing key returns success. Then **invalidate all cache entries** for that `(mount_id, name)`. Without `KeyLifecycle`, respond 204 and do nothing (or 405 if `RejectUnmanagedKeyOps` is set).
-- Option `RequireDeletionAllowed` (default false) rejects DELETE with 400 unless `config` was called first. It defaults to false because transhim may restart between the two calls.
+- `config`: accept `deletion_allowed` (bool) and ignore all other fields. Record `deletion_allowed` in memory per `(mount_id, name)` (it is a best-effort safety latch; it does not need to be durable). It is only recorded on mounts with `RequireDeletionAllowed`, the only place where it is read, and dropped when the key is deleted. Respond 204 with an **empty body**. This is required, not cosmetic: RGW before tentacle treats a non-empty `config` response as a failure and then never sends the `DELETE` (compat.md). `config` on a key the backend does not know also answers 204, since transhim cannot tell in general.
+- `DELETE`: if the backend implements `KeyLifecycle`, call `DeleteKey`. Deletion is idempotent: a missing key returns success. Then **invalidate all cache entries** for that `(mount_id, name)`. Without `KeyLifecycle`, respond 204 without calling the backend (or 405 if `RejectUnmanagedKeyOps` is set); the cache entries are invalidated all the same, since the key may have been removed in the KMS.
+- `GET keys/{name}` answers 404 (D7). Other methods on `keys/...` answer 405.
+- Mount option `RequireDeletionAllowed` (default false) rejects DELETE with 400 unless `config` was called first. It defaults to false because transhim may restart between the two calls.
 
 ### 6.7 Token stubs and health — deferred (D6, D8), not in v1
 
@@ -438,12 +439,14 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 - Bounded by `MaxEntries` (LRU) and `TTL`. Both are required when the cache is enabled.
 - Invalidation: on `DELETE keys/{name}`, all entries for `(mount_id, name)` are removed. This requires a secondary index from `(mount_id, name)` to a set of cache keys. Invalidation is local to the process: with several transhim instances, the others keep serving cached plaintext until TTL.
 - Errors are never cached.
+- A cache hit never bypasses the authorizer: authorization runs before the lookup.
+- A decrypt that is in flight while its key is deleted must not store its result afterwards. The cache counts invalidations, and a result is only stored if no invalidation happened since the backend call started.
 - `datakey` and `encrypt` responses are never cached. However, the plaintext produced by `datakey` *may* be inserted into the decrypt cache, behind the option `WarmOnDatakey`, which defaults to false.
 - Documentation must state that TTL equals the maximum delay for revocations performed directly in the cloud KMS, and for key deletions handled by another instance, to take effect.
 
 ## 10. Audit, Logging, Observability
 
-- `AuditEvent{Time, Op, MountID, KeyName, CacheHit, Duration, Status, Err, RemoteAddr, RequestID}` is passed to the hook synchronously after each request. The hook must not block. This is documented, and an async helper is optionally provided.
+- `AuditEvent{Time, Op, MountID, KeyName, CacheHit, Duration, Status, Err, RemoteAddr, RequestID}` is passed to the hook synchronously after each request, once the answer is written. Every request produces an event, including rejected ones and those that match no mount (their `Op`, `MountID`, or `KeyName` are empty). `Err` carries backend error details that the client does not get. The hook must not block; this is documented. No async helper is provided in v1.
 - Logging uses `log/slog`. **Never log** plaintext, ciphertext, tokens, or request bodies. Key names may be logged.
 - Metrics: no built-in exporter in v1. The audit hook is sufficient to build them.
 
@@ -490,7 +493,7 @@ Generate golden fixtures (request and response pairs) from a real Vault or OpenB
 
 0. **M0 – Capture** (done): record the real requests of Ceph RGW (SSE-KMS and SSE-S3) against Vault or OpenBao, covering §12 items 1, 2, 4, and 6. These results determine the exact v1 endpoint set (see the v1 scope rule in §2), the API shape, the "key not found" response, and whether lazy key creation is needed, so they come before M1. Record them in `docs/compat.md`.
 1. **M1 – Core** (done): server, routing, envelope, AAD, error mapping, `datakey/plaintext`, `decrypt`, `encrypt`, authorizer, FakeBackend, unit tests.
-2. **M2 – Key ops**: `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
+2. **M2 – Key ops** (done): `keys` create/config/delete, `KeyLifecycle`, decrypt cache with invalidation, audit hook.
 3. **M3 – Hierarchical backend** + memstore + tests.
 4. **M4 – RGW acceptance**: golden fixtures from the M0 capture, conformance suite, and the RGW integration test (§13) passing for SSE-KMS and SSE-S3. This is the v1 acceptance criterion.
 5. **M5 – Examples & docs**: AWS KMS example, RGW configuration guide, README.

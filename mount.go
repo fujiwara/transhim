@@ -16,6 +16,10 @@ type mount struct {
 	id               string
 	backend          Backend
 	maxPlaintextSize int
+	// lifecycle is the backend's KeyLifecycle, or nil.
+	lifecycle              KeyLifecycle
+	rejectUnmanagedKeyOps  bool
+	requireDeletionAllowed bool
 }
 
 // MountOption configures a single mount.
@@ -30,6 +34,29 @@ func WithMaxPlaintextSize(n int) MountOption {
 			return errors.New("max plaintext size must be positive")
 		}
 		m.maxPlaintextSize = n
+		return nil
+	}
+}
+
+// RejectUnmanagedKeyOps makes the mount answer key create, config, and delete
+// requests with 405 if its backend does not implement KeyLifecycle. By
+// default they are answered with success and do nothing, which is what a
+// client that insists on managing keys (Ceph RGW with SSE-S3) needs when the
+// keys are provisioned by other means.
+func RejectUnmanagedKeyOps() MountOption {
+	return func(m *mount) error {
+		m.rejectUnmanagedKeyOps = true
+		return nil
+	}
+}
+
+// RequireDeletionAllowed makes the mount refuse to delete a key unless the
+// client set deletion_allowed through the key's config first, as Vault does.
+// The flag is kept in memory only: after a restart of the server, the client
+// has to set it again.
+func RequireDeletionAllowed() MountOption {
+	return func(m *mount) error {
+		m.requireDeletionAllowed = true
 		return nil
 	}
 }
@@ -66,6 +93,7 @@ func Mount(prefix, mountID string, backend Backend, opts ...MountOption) Option 
 				return fmt.Errorf("mount %q: %w", prefix, err)
 			}
 		}
+		m.lifecycle, _ = backend.(KeyLifecycle)
 		for _, other := range c.mounts {
 			if other.prefix == m.prefix {
 				return fmt.Errorf("mount %q: prefix is already mounted", prefix)

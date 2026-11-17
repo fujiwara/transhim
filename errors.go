@@ -52,12 +52,22 @@ func (e *UpstreamError) Is(target error) bool { return target == ErrUpstream }
 type requestError struct {
 	status int
 	msg    string
+	// allow is the Allow header of a 405.
+	allow string
 }
 
 func (e *requestError) Error() string { return e.msg }
 
 func (e *requestError) Is(target error) bool {
 	return e.status == http.StatusBadRequest && target == ErrInvalidRequest
+}
+
+func methodNotAllowed(allow string) error {
+	return &requestError{status: http.StatusMethodNotAllowed, msg: "unsupported operation", allow: allow}
+}
+
+func notFound(msg string) error {
+	return &requestError{status: http.StatusNotFound, msg: msg}
 }
 
 func badRequest(msg string) error {

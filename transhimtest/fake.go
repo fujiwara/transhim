@@ -19,12 +19,15 @@ const (
 	OpEncrypt         = "encrypt"
 	OpDecrypt         = "decrypt"
 	OpGenerateDataKey = "generate_data_key"
+	OpCreateKey       = "create_key"
+	OpDeleteKey       = "delete_key"
 )
 
 const fakeKeyRef = "fake"
 
 // FakeBackend is a transhim.Backend that keeps AES-256 keys in memory and
-// wraps with AES-GCM, binding the AAD. Keys exist only after AddKey.
+// wraps with AES-GCM, binding the AAD. It also implements
+// transhim.KeyLifecycle. A key exists after AddKey or CreateKey.
 //
 // It can inject errors and latency, and counts calls. It is safe for
 // concurrent use.
@@ -67,6 +70,59 @@ func (b *FakeBackend) RemoveKey(mountID, name string) {
 	delete(b.keys, fakeKeyID{mountID, name})
 }
 
+// HasKey reports whether a key exists for (mountID, name).
+func (b *FakeBackend) HasKey(mountID, name string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.keys[fakeKeyID{mountID, name}]
+	return ok
+}
+
+// lifecycle counts a key lifecycle call and applies the delay and injected
+// error.
+func (b *FakeBackend) lifecycle(ctx context.Context, op string) error {
+	b.mu.Lock()
+	b.calls[op]++
+	delay, injected := b.delay, b.errs[op]
+	b.mu.Unlock()
+	if err := wait(ctx, delay); err != nil {
+		return err
+	}
+	return injected
+}
+
+// CreateKey implements transhim.KeyLifecycle. An existing key is kept.
+func (b *FakeBackend) CreateKey(ctx context.Context, mountID, keyName string) error {
+	if err := b.lifecycle(ctx, OpCreateKey); err != nil {
+		return err
+	}
+	b.AddKey(mountID, keyName)
+	return nil
+}
+
+// DeleteKey implements transhim.KeyLifecycle. A missing key is not an error.
+func (b *FakeBackend) DeleteKey(ctx context.Context, mountID, keyName string) error {
+	if err := b.lifecycle(ctx, OpDeleteKey); err != nil {
+		return err
+	}
+	b.RemoveKey(mountID, keyName)
+	return nil
+}
+
+func wait(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // SetError makes every later call of op (one of the Op constants of this
 // package) fail with err. A nil err removes the injection.
 func (b *FakeBackend) SetError(op string, err error) {
@@ -103,14 +159,8 @@ func (b *FakeBackend) begin(ctx context.Context, op, mountID, name string) (ciph
 	key, ok := b.keys[fakeKeyID{mountID, name}]
 	b.mu.Unlock()
 
-	if delay > 0 {
-		t := time.NewTimer(delay)
-		defer t.Stop()
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	if err := wait(ctx, delay); err != nil {
+		return nil, err
 	}
 	if injected != nil {
 		return nil, injected

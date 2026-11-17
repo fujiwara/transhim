@@ -83,6 +83,45 @@ func TestFakeBackendInjection(t *testing.T) {
 	}
 }
 
+func TestFakeBackendKeyLifecycle(t *testing.T) {
+	ctx := t.Context()
+	b := transhimtest.NewFakeBackend()
+	var _ transhim.KeyLifecycle = b
+
+	if err := b.CreateKey(ctx, "m", "k"); err != nil || !b.HasKey("m", "k") {
+		t.Fatalf("CreateKey: %v, HasKey = %v", err, b.HasKey("m", "k"))
+	}
+	wk, err := b.Encrypt(ctx, transhim.EncryptRequest{MountID: "m", KeyName: "k", Plaintext: []byte("p")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// creating again keeps the key
+	if err := b.CreateKey(ctx, "m", "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Decrypt(ctx, transhim.DecryptRequest{MountID: "m", KeyName: "k", Wrapped: wk}); err != nil {
+		t.Errorf("Decrypt after a second CreateKey: %v", err)
+	}
+	// deleting is idempotent
+	for range 2 {
+		if err := b.DeleteKey(ctx, "m", "k"); err != nil || b.HasKey("m", "k") {
+			t.Errorf("DeleteKey: %v, HasKey = %v", err, b.HasKey("m", "k"))
+		}
+	}
+	boom := errors.New("boom")
+	b.SetError(transhimtest.OpCreateKey, boom)
+	b.SetError(transhimtest.OpDeleteKey, boom)
+	if err := b.CreateKey(ctx, "m", "k"); !errors.Is(err, boom) || b.HasKey("m", "k") {
+		t.Errorf("CreateKey with an injected error: %v, HasKey = %v", err, b.HasKey("m", "k"))
+	}
+	if err := b.DeleteKey(ctx, "m", "k"); !errors.Is(err, boom) {
+		t.Errorf("DeleteKey with an injected error: %v", err)
+	}
+	if c, d := b.Calls(transhimtest.OpCreateKey), b.Calls(transhimtest.OpDeleteKey); c != 3 || d != 3 {
+		t.Errorf("Calls = %d creates, %d deletes; want 3, 3", c, d)
+	}
+}
+
 func TestFakeDataKeyBackend(t *testing.T) {
 	ctx := t.Context()
 	b := transhimtest.NewFakeBackend()

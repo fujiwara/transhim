@@ -4,7 +4,7 @@ A Go framework for building HashiCorp Vault Transit–compatible API servers who
 
 The first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
 
-**Status: pre-release, under development.** The core is implemented (`datakey/plaintext`, `decrypt`, `encrypt`, authorization). Still missing for Ceph RGW SSE-S3: key create/config/delete, the decrypt cache, and the hierarchical backend. The API may change until the first release.
+**Status: pre-release, under development.** The server is implemented: `datakey/plaintext`, `decrypt`, `encrypt`, key create/config/delete, authorization, the decrypt cache, and the audit hook. Still missing: the hierarchical backend (per-bucket keys for Ceph RGW SSE-S3 without one KMS key per bucket) and the acceptance test against a real RGW. The API may change until the first release.
 
 - [docs/DESIGN.md](docs/DESIGN.md): design document
 - [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, and how the reference implementation answers
@@ -43,7 +43,25 @@ Things to know:
 - An `Authorizer` is required. `transhim.AllowUnauthenticated()` turns that off explicitly.
 - Backends report failures by wrapping `ErrKeyNotFound`, `ErrCiphertextMismatch`, `ErrPermissionDenied`, or `ErrUpstream`. Details go to the log, never to the client.
 - A backend may also implement `DataKeyGenerator` if its KMS has a native "generate data key" call.
+- A backend may implement `KeyLifecycle` to create and delete keys when the client asks (Ceph RGW does, for SSE-S3: one key per bucket). Without it, those requests succeed and do nothing, and keys are expected to exist in the KMS.
 - `transhimtest.FakeBackend` is an in-memory backend for tests.
+
+### Decrypt cache
+
+Ceph RGW calls `decrypt` on every read of an encrypted object, including HeadObject and each part of a multipart upload, always with the same wrapped key. The decrypt cache answers those without calling the KMS:
+
+```go
+transhim.WithDecryptCache(transhim.DecryptCacheConfig{
+	MaxEntries: 10000,
+	TTL:        5 * time.Minute,
+})
+```
+
+It is off by default. It holds plaintext data keys in memory, so **the TTL is the longest time a revocation can take to become effective** when it happens behind the server's back: disabling a key directly in the KMS, or deleting a key through another transhim instance. Deleting a key through the same instance removes its entries at once. Requests are authorized before the cache is consulted.
+
+### Audit
+
+`transhim.WithAuditHook(fn)` calls `fn` with an `AuditEvent` (operation, mount ID, key name, status, error, cache hit, duration, peer address, request ID) after every request. The hook runs synchronously and must not block. Events never contain key material, ciphertexts, or tokens.
 
 ## Development
 

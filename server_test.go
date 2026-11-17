@@ -80,6 +80,13 @@ func (e *env) send(req *http.Request) *reply {
 	res := w.Result()
 	b, _ := io.ReadAll(res.Body)
 	r := &reply{status: res.StatusCode, header: res.Header, body: b}
+	if res.StatusCode == http.StatusNoContent {
+		// RGW needs these answers to be really empty
+		if len(b) != 0 || res.Header.Get("Content-Type") != "" || res.Header.Get("Content-Length") != "" {
+			e.t.Errorf("%s %s: 204 with body %q, headers %v", req.Method, req.URL, b, res.Header)
+		}
+		return r
+	}
 	if err := json.Unmarshal(b, r); err != nil {
 		e.t.Fatalf("%s %s: response is not JSON: %q", req.Method, req.URL, b)
 	}

@@ -75,6 +75,22 @@ type DataKeyGenerator interface {
 	GenerateDataKey(ctx context.Context, req DataKeyRequest) (plaintext []byte, wrapped WrappedKey, err error)
 }
 
+// KeyLifecycle is an optional capability of a Backend that creates and deletes
+// keys on request of the client. Ceph RGW uses it for SSE-S3, where it manages
+// one key per bucket.
+//
+// Without it, key creation and deletion requests are answered with success and
+// do nothing: keys are assumed to be provisioned in the KMS by other means.
+type KeyLifecycle interface {
+	// CreateKey creates the key. It must be idempotent: if the key exists, it
+	// must leave it untouched and return nil. RGW asks again for a key it
+	// created earlier and expects old ciphertexts to stay decryptable.
+	CreateKey(ctx context.Context, mountID, keyName string) error
+	// DeleteKey deletes the key, making its ciphertexts undecryptable. It
+	// must be idempotent: a missing key is not an error.
+	DeleteKey(ctx context.Context, mountID, keyName string) error
+}
+
 // DataKeyRequest is the input of DataKeyGenerator.GenerateDataKey.
 type DataKeyRequest struct {
 	// MountID identifies the mount. It is never the mount's prefix.

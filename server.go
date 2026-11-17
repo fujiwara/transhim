@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // DefaultMaxBodySize is the default limit for request bodies.
@@ -25,6 +27,8 @@ type config struct {
 	allowUnauthenticated bool
 	logger               *slog.Logger
 	maxBodySize          int64
+	cache                *DecryptCacheConfig
+	auditHook            AuditHook
 }
 
 // Option configures a Server.
@@ -74,13 +78,47 @@ func WithMaxBodySize(n int64) Option {
 	}
 }
 
+// WithDecryptCache enables the decrypt cache, which is off by default. It
+// answers repeated decrypt requests for the same ciphertext, key name, and
+// context without calling the backend. Requests are still authorized, and
+// failures are never cached. See DecryptCacheConfig for what the TTL means for
+// revocation.
+func WithDecryptCache(cfg DecryptCacheConfig) Option {
+	return func(c *config) error {
+		if err := cfg.validate(); err != nil {
+			return err
+		}
+		c.cache = &cfg
+		return nil
+	}
+}
+
+// WithAuditHook sets a function that is told about every request.
+func WithAuditHook(fn AuditHook) Option {
+	return func(c *config) error {
+		if fn == nil {
+			return errors.New("audit hook must not be nil")
+		}
+		c.auditHook = fn
+		return nil
+	}
+}
+
 // Server is an http.Handler that serves the Vault Transit API for its mounts.
 // It serves nothing outside of them.
 type Server struct {
-	mounts      []*mount // longest prefix first
-	authorizer  Authorizer
-	logger      *slog.Logger
-	maxBodySize int64
+	mounts        []*mount // longest prefix first
+	authorizer    Authorizer
+	logger        *slog.Logger
+	maxBodySize   int64
+	cache         *decryptCache // nil if disabled
+	warmOnDatakey bool
+	auditHook     AuditHook
+
+	// deletionAllowed holds the keys whose config set deletion_allowed, for
+	// mounts with RequireDeletionAllowed.
+	mu              sync.Mutex
+	deletionAllowed map[keyID]struct{}
 }
 
 // NewServer builds a Server. It needs at least one Mount, and either
@@ -105,10 +143,16 @@ func NewServer(opts ...Option) (*Server, error) {
 		c.logger = slog.Default()
 	}
 	s := &Server{
-		mounts:      c.mounts,
-		authorizer:  c.authorizer,
-		logger:      c.logger,
-		maxBodySize: c.maxBodySize,
+		mounts:          c.mounts,
+		authorizer:      c.authorizer,
+		logger:          c.logger,
+		maxBodySize:     c.maxBodySize,
+		auditHook:       c.auditHook,
+		deletionAllowed: map[keyID]struct{}{},
+	}
+	if c.cache != nil {
+		s.cache = newDecryptCache(*c.cache)
+		s.warmOnDatakey = c.cache.WarmOnDatakey
 	}
 	// A prefix may be nested in another one: the longest match wins.
 	sort.SliceStable(s.mounts, func(i, j int) bool {
@@ -128,9 +172,12 @@ func (s *Server) route(escapedPath string) (*mount, string, bool) {
 	return nil, "", false
 }
 
-// parseOp splits the escaped path below a mount into the operation and the
-// still escaped key name.
-func parseOp(rest string) (Op, string, bool) {
+var errUnsupportedPath = notFound("unsupported path")
+
+// parseOp maps the method and the escaped path below a mount to an operation
+// and the still escaped key name.
+func parseOp(method, rest string) (Op, string, error) {
+	write := method == http.MethodPost || method == http.MethodPut
 	for _, o := range []struct {
 		prefix string
 		op     Op
@@ -140,59 +187,113 @@ func parseOp(rest string) (Op, string, bool) {
 		{"decrypt/", OpDecrypt},
 	} {
 		if name, ok := strings.CutPrefix(rest, o.prefix); ok {
-			return o.op, name, true
+			if !write {
+				return o.op, "", methodNotAllowed("POST, PUT")
+			}
+			return o.op, name, nil
 		}
 	}
-	return "", "", false
+	name, ok := strings.CutPrefix(rest, "keys/")
+	if !ok {
+		return "", "", errUnsupportedPath
+	}
+	if base, ok := strings.CutSuffix(name, "/config"); ok && !strings.Contains(base, "/") {
+		if !write {
+			return OpKeyConfig, "", methodNotAllowed("POST, PUT")
+		}
+		return OpKeyConfig, base, nil
+	}
+	switch {
+	case write:
+		return OpKeyCreate, name, nil
+	case method == http.MethodDelete:
+		return OpKeyDelete, name, nil
+	case method == http.MethodGet:
+		// reading key metadata is not supported (DESIGN.md D7)
+		return "", "", errUnsupportedPath
+	}
+	return "", "", methodNotAllowed("POST, PUT, DELETE")
 }
 
 // request is the state of one request being served.
 type request struct {
-	id      string
-	op      Op
-	mount   *mount
-	keyName string
+	id       string
+	op       Op
+	mount    *mount
+	keyName  string
+	cacheHit bool
 }
 
-// result is a successful answer.
+func (req *request) keyID() keyID { return keyID{req.mount.id, req.keyName} }
+
+// result is a successful answer: 200 with data, or 204 without a body if data
+// is nil.
 type result struct {
 	data     any
 	warnings []string
 }
 
+// noContent is the answer of the key operations. It must stay without a body:
+// Ceph RGW before tentacle treats a body in the answer to keys/{name}/config
+// as a failure and then never deletes the key (docs/compat.md).
+var noContent = &result{}
+
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	req := &request{id: newRequestID()}
 	res, err := s.serve(w, r, req)
-	if err != nil {
-		s.writeError(w, r, req, err)
-		return
+	var status int
+	switch {
+	case err != nil:
+		status = s.writeError(w, r, req, err)
+	case res.data == nil:
+		status = http.StatusNoContent
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+	default:
+		status = http.StatusOK
+		writeJSON(w, status, response{
+			RequestID: req.id,
+			Data:      res.data,
+			Warnings:  res.warnings,
+		})
+		zeroResult(res.data)
 	}
-	writeJSON(w, http.StatusOK, response{
-		RequestID: req.id,
-		Data:      res.data,
-		Warnings:  res.warnings,
-	})
-	zeroResult(res.data)
+	if s.auditHook != nil {
+		ev := AuditEvent{
+			Time:       start,
+			Op:         req.op,
+			KeyName:    req.keyName,
+			CacheHit:   req.cacheHit,
+			Duration:   time.Since(start),
+			Status:     status,
+			Err:        err,
+			RemoteAddr: r.RemoteAddr,
+			RequestID:  req.id,
+		}
+		if req.mount != nil {
+			ev.MountID = req.mount.id
+		}
+		s.auditHook(r.Context(), ev)
+	}
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*result, error) {
 	m, rest, ok := s.route(r.URL.EscapedPath())
 	if !ok {
-		return nil, &requestError{status: http.StatusNotFound, msg: "no handler for route"}
+		return nil, notFound("no handler for route")
 	}
 	req.mount = m
-	op, escapedName, ok := parseOp(rest)
-	if !ok {
-		// Worth a warning: it may be a client using an API transhim lacks.
-		s.logger.WarnContext(r.Context(), "unsupported path",
-			"request_id", req.id, "mount_id", m.id, "method", r.Method, "path", r.URL.Path)
-		return nil, &requestError{status: http.StatusNotFound, msg: "unsupported path"}
-	}
+	op, escapedName, err := parseOp(r.Method, rest)
 	req.op = op
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		w.Header().Set("Allow", "POST, PUT")
-		return nil, &requestError{status: http.StatusMethodNotAllowed, msg: "unsupported operation"}
+	if err != nil {
+		if err == errUnsupportedPath {
+			// Worth a warning: it may be a client using an API transhim lacks.
+			s.logger.WarnContext(r.Context(), "unsupported path",
+				"request_id", req.id, "mount_id", m.id, "method", r.Method, "path", r.URL.Path)
+		}
+		return nil, err
 	}
 	name, err := url.PathUnescape(escapedName)
 	if err != nil {
@@ -229,6 +330,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 		return s.handleEncrypt(r.Context(), req, body)
 	case OpDecrypt:
 		return s.handleDecrypt(r.Context(), req, body)
+	case OpKeyCreate:
+		return s.handleKeyCreate(r.Context(), req, body)
+	case OpKeyConfig:
+		return s.handleKeyConfig(req, body)
+	case OpKeyDelete:
+		return s.handleKeyDelete(r.Context(), req)
 	}
 	return nil, fmt.Errorf("unhandled operation %q", op)
 }
@@ -301,11 +408,15 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 	m := req.mount
 	aad := buildAAD(m.id, req.keyName, context)
 	size := bits / 8
+	var gen uint64
+	if s.warmOnDatakey {
+		gen = s.cache.generation()
+	}
 
 	var plaintext []byte
 	var wk WrappedKey
-	if gen, ok := m.backend.(DataKeyGenerator); ok {
-		plaintext, wk, err = gen.GenerateDataKey(ctx, DataKeyRequest{
+	if g, ok := m.backend.(DataKeyGenerator); ok {
+		plaintext, wk, err = g.GenerateDataKey(ctx, DataKeyRequest{
 			MountID: m.id, KeyName: req.keyName, Bytes: size, AAD: aad,
 		})
 		if err == nil && len(plaintext) != size {
@@ -327,6 +438,9 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 		Plaintext:  base64.StdEncoding.EncodeToString(plaintext),
 		Ciphertext: encodeEnvelope(wk),
 		KeyVersion: keyVersion(wk),
+	}
+	if s.warmOnDatakey {
+		s.cache.put(newCacheKey(m.id, req.keyName, context, data.Ciphertext), req.keyID(), plaintext, gen)
 	}
 	clear(plaintext)
 	return &result{data: data}, nil
@@ -410,6 +524,19 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 		return nil, err
 	}
 	m := req.mount
+
+	var ck cacheKey
+	var gen uint64
+	if s.cache != nil {
+		ck = newCacheKey(m.id, req.keyName, context, *in.Ciphertext)
+		if plaintext, ok := s.cache.get(ck); ok {
+			req.cacheHit = true
+			data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
+			clear(plaintext)
+			return &result{data: data}, nil
+		}
+		gen = s.cache.generation()
+	}
 	plaintext, err := m.backend.Decrypt(ctx, DecryptRequest{
 		MountID: m.id,
 		KeyName: req.keyName,
@@ -419,9 +546,98 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	if err != nil {
 		return nil, err
 	}
+	if s.cache != nil {
+		s.cache.put(ck, req.keyID(), plaintext, gen)
+	}
 	data := &decryptData{Plaintext: base64.StdEncoding.EncodeToString(plaintext)}
 	clear(plaintext)
 	return &result{data: data}, nil
+}
+
+// unmanaged answers a key operation on a mount whose backend has no
+// KeyLifecycle.
+func unmanaged(m *mount) (*result, error) {
+	if m.rejectUnmanagedKeyOps {
+		return nil, methodNotAllowed("")
+	}
+	return noContent, nil
+}
+
+type keyCreateBody struct {
+	Exportable bool `json:"exportable"`
+}
+
+func (s *Server) handleKeyCreate(ctx context.Context, req *request, body []byte) (*result, error) {
+	var in keyCreateBody
+	if err := decodeBody(body, &in); err != nil {
+		return nil, err
+	}
+	if in.Exportable {
+		return nil, badRequest("exportable keys are not supported")
+	}
+	m := req.mount
+	if m.lifecycle == nil {
+		return unmanaged(m)
+	}
+	if err := m.lifecycle.CreateKey(ctx, m.id, req.keyName); err != nil {
+		return nil, err
+	}
+	return noContent, nil
+}
+
+type keyConfigBody struct {
+	DeletionAllowed *bool `json:"deletion_allowed"`
+}
+
+func (s *Server) handleKeyConfig(req *request, body []byte) (*result, error) {
+	var in keyConfigBody
+	if err := decodeBody(body, &in); err != nil {
+		return nil, err
+	}
+	m := req.mount
+	if m.lifecycle == nil && m.rejectUnmanagedKeyOps {
+		return unmanaged(m)
+	}
+	// The flag is only kept where it is going to be checked.
+	if in.DeletionAllowed != nil && m.requireDeletionAllowed {
+		s.mu.Lock()
+		if *in.DeletionAllowed {
+			s.deletionAllowed[req.keyID()] = struct{}{}
+		} else {
+			delete(s.deletionAllowed, req.keyID())
+		}
+		s.mu.Unlock()
+	}
+	return noContent, nil
+}
+
+func (s *Server) handleKeyDelete(ctx context.Context, req *request) (*result, error) {
+	m := req.mount
+	if m.lifecycle == nil && m.rejectUnmanagedKeyOps {
+		return unmanaged(m)
+	}
+	if m.requireDeletionAllowed {
+		s.mu.Lock()
+		_, allowed := s.deletionAllowed[req.keyID()]
+		s.mu.Unlock()
+		if !allowed {
+			return nil, badRequest("deletion is not allowed for this key")
+		}
+	}
+	if m.lifecycle != nil {
+		if err := m.lifecycle.DeleteKey(ctx, m.id, req.keyName); err != nil {
+			return nil, err
+		}
+	}
+	if s.cache != nil {
+		s.cache.invalidate(req.keyID())
+	}
+	if m.requireDeletionAllowed {
+		s.mu.Lock()
+		delete(s.deletionAllowed, req.keyID())
+		s.mu.Unlock()
+	}
+	return noContent, nil
 }
 
 // response is Vault's response envelope. Clients only need "data"; the other
@@ -455,9 +671,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	clear(b)
 }
 
-// writeError answers with a Vault-style error. Details of the error go to the
-// log only.
-func (s *Server) writeError(w http.ResponseWriter, r *http.Request, req *request, err error) {
+// writeError answers with a Vault-style error and returns the status. Details
+// of the error go to the log only.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, req *request, err error) int {
 	status, msg := errorResponse(err)
 	level := slog.LevelDebug
 	if status >= 500 {
@@ -474,7 +690,11 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, req *request
 		attrs = append(attrs, "key_name", req.keyName)
 	}
 	s.logger.Log(r.Context(), level, "request failed", attrs...)
+	if re, ok := errors.AsType[*requestError](err); ok && re.allow != "" {
+		w.Header().Set("Allow", re.allow)
+	}
 	writeJSON(w, status, errorBody{Errors: []string{msg}})
+	return status
 }
 
 // zeroResult clears the base64 plaintext of a response after it was written.
