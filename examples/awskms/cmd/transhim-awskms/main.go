@@ -138,6 +138,12 @@ func audit(ctx context.Context, ev transhim.AuditEvent) {
 		"status", ev.Status, "cache_hit", ev.CacheHit, "duration", ev.Duration,
 		"remote_addr", ev.RemoteAddr, "request_id", ev.RequestID,
 	}
+	if ev.Context != nil {
+		// With Ceph RGW: a JSON object naming the S3 object the request is
+		// for. With SSE-KMS the S3 user can change it, so it is a record of
+		// what was claimed, not proof.
+		attrs = append(attrs, "context", string(ev.Context))
+	}
 	if ev.Err != nil {
 		attrs = append(attrs, "error", ev.Err.Error())
 	}
