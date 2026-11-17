@@ -201,7 +201,8 @@ func (b *FakeBackend) Decrypt(ctx context.Context, req transhim.DecryptRequest) 
 		return nil, err
 	}
 	blob := req.Wrapped.Blob
-	if req.Wrapped.KeyRef != fakeKeyRef || len(blob) < aead.NonceSize() {
+	// KeyRef and Version are not covered by the AAD, so check them here.
+	if req.Wrapped.KeyRef != fakeKeyRef || req.Wrapped.Version != 1 || len(blob) < aead.NonceSize() {
 		return nil, transhim.ErrCiphertextMismatch
 	}
 	plaintext, err := aead.Open(nil, blob[:aead.NonceSize()], blob[aead.NonceSize():], req.AAD)

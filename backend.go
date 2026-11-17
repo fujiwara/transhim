@@ -55,8 +55,10 @@ type DecryptRequest struct {
 type WrappedKey struct {
 	// KeyRef is an opaque reference to the exact key (and key version) the
 	// backend used, for example a KMS key ARN. It is returned on encrypt and
-	// given back on decrypt. It is not authenticated by the server: a backend
-	// that acts on it must make sure that doing so is safe.
+	// given back on decrypt. Neither KeyRef nor Version is authenticated by
+	// the server: a client can change them in a ciphertext. A backend that
+	// acts on them must make sure that doing so is safe, and should reject
+	// values it would not have produced.
 	KeyRef string
 	// Version is the key version shown to clients as "vault:vN". Values below
 	// 1 are reported as 1.

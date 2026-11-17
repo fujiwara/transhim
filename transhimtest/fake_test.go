@@ -38,8 +38,9 @@ func TestFakeBackend(t *testing.T) {
 	mismatches := map[string]transhim.DecryptRequest{
 		"wrong AAD":  {MountID: "m", KeyName: "k", Wrapped: wk, AAD: []byte("other")},
 		"wrong key":  {MountID: "m", KeyName: "other", Wrapped: wk, AAD: []byte("aad")},
-		"wrong ref":  {MountID: "m", KeyName: "k", Wrapped: transhim.WrappedKey{KeyRef: "x", Blob: wk.Blob}, AAD: []byte("aad")},
-		"short blob": {MountID: "m", KeyName: "k", Wrapped: transhim.WrappedKey{KeyRef: wk.KeyRef, Blob: []byte("x")}, AAD: []byte("aad")},
+		"wrong ref":  {MountID: "m", KeyName: "k", Wrapped: transhim.WrappedKey{KeyRef: "x", Version: 1, Blob: wk.Blob}, AAD: []byte("aad")},
+		"wrong ver":  {MountID: "m", KeyName: "k", Wrapped: transhim.WrappedKey{KeyRef: wk.KeyRef, Version: 2, Blob: wk.Blob}, AAD: []byte("aad")},
+		"short blob": {MountID: "m", KeyName: "k", Wrapped: transhim.WrappedKey{KeyRef: wk.KeyRef, Version: 1, Blob: []byte("x")}, AAD: []byte("aad")},
 	}
 	for name, req := range mismatches {
 		if _, err := b.Decrypt(ctx, req); !errors.Is(err, transhim.ErrCiphertextMismatch) {

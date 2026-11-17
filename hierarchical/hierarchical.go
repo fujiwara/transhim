@@ -289,7 +289,8 @@ func (b *Backend) Encrypt(ctx context.Context, req transhim.EncryptRequest) (tra
 
 // Decrypt implements transhim.Backend.
 func (b *Backend) Decrypt(ctx context.Context, req transhim.DecryptRequest) ([]byte, error) {
-	if req.Wrapped.KeyRef != keyRef {
+	// KeyRef and Version are not covered by the AAD, so check them here.
+	if req.Wrapped.KeyRef != keyRef || req.Wrapped.Version != 1 {
 		return nil, transhim.ErrCiphertextMismatch
 	}
 	aead, err := b.key(ctx, req.MountID, req.KeyName)

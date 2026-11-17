@@ -124,11 +124,16 @@ func TestRoundTrip(t *testing.T) {
 		"wrong key": func() ([]byte, error) { return decrypt(t, f.b, "other", wk, "aad") },
 		"tampered":  func() ([]byte, error) { return decrypt(t, f.b, bucket, tampered, "aad") },
 		"short blob": func() ([]byte, error) {
-			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Blob: wk.Blob[:27]}, "aad")
+			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Version: 1, Blob: wk.Blob[:27]}, "aad")
 		},
-		"empty blob": func() ([]byte, error) { return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1"}, "aad") },
+		"empty blob": func() ([]byte, error) {
+			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Version: 1}, "aad")
+		},
+		"wrong version": func() ([]byte, error) {
+			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Version: 2, Blob: wk.Blob}, "aad")
+		},
 		"foreign ref": func() ([]byte, error) {
-			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "fake", Blob: wk.Blob}, "aad")
+			return decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "fake", Version: 1, Blob: wk.Blob}, "aad")
 		},
 	}
 	for name, fn := range mismatches {
@@ -145,7 +150,7 @@ func TestKeyNotFound(t *testing.T) {
 	if _, err := f.b.Encrypt(ctx, transhim.EncryptRequest{MountID: mountID, KeyName: bucket}); !errors.Is(err, transhim.ErrKeyNotFound) {
 		t.Errorf("Encrypt without a key: err = %v, want ErrKeyNotFound", err)
 	}
-	if _, err := decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Blob: make([]byte, 40)}, ""); !errors.Is(err, transhim.ErrKeyNotFound) {
+	if _, err := decrypt(t, f.b, bucket, transhim.WrappedKey{KeyRef: "h1", Version: 1, Blob: make([]byte, 40)}, ""); !errors.Is(err, transhim.ErrKeyNotFound) {
 		t.Errorf("Decrypt without a key: err = %v, want ErrKeyNotFound", err)
 	}
 	if f.store.Len() != 0 {
