@@ -1,6 +1,6 @@
 # Writing a server with transhim
 
-transhim is a library: you write the `main`, the backend for your KMS, and the rules for who may use which key. This guide covers what that takes for a server you can run in production. For the Ceph RGW side, see [rgw.md](rgw.md).
+transhim is a library: you write the `main`, the backend for your KMS, and the rules for who may use which key. This guide covers what that takes for a server you can run in production. For the Ceph RGW side, see [rgw.md](rgw.md); for the HTTP API the server speaks, see [api.md](api.md).
 
 The examples ([awskms](../examples/awskms), [sakurakms](../examples/sakurakms), [sqlkeystore](../examples/sqlkeystore)) are working code for most of what follows. Their servers keep the per-bucket keys in memory, which this guide replaces.
 

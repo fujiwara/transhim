@@ -18,6 +18,7 @@ What it is not: a Vault replacement, or a ready-made server. You write your own 
 Documents:
 
 - [docs/server.md](docs/server.md): writing a server for production: the backend, authorization, per-bucket keys, caches, and operation
+- [docs/api.md](docs/api.md): the HTTP API: which Transit endpoints are served, how each is processed, and the differences from Vault
 - [docs/rgw.md](docs/rgw.md): configuring Ceph RGW, and what to know before going live
 - [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, how it reacts to failures, and where transhim differs from Vault
 - [examples/awskms](examples/awskms): an AWS KMS backend and an example server
