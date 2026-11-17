@@ -52,7 +52,7 @@ Things to know:
 
 - **The mount ID is permanent.** It is part of the data bound to every ciphertext. Changing it makes all existing ciphertexts of that mount undecryptable. The prefix, in contrast, can change freely.
 - **Use TLS.** The Transit datakey API returns data keys in plaintext.
-- **Authorization per key is yours to do.** Ceph RGW does not check whether an S3 user may use a given key ID. Check it in the `Authorizer` or in the backend.
+- **Authorization per key is yours to do.** Ceph RGW does not check whether an S3 user may use a given key ID. Check it in the `Authorizer`. A backend can limit which KMS keys a name may reach at all, but it is not called for requests answered from the decrypt cache.
 - An `Authorizer` is required. `transhim.AllowUnauthenticated()` turns that off explicitly.
 - Backends report failures by wrapping `ErrKeyNotFound`, `ErrCiphertextMismatch`, `ErrPermissionDenied`, or `ErrUpstream`. Details go to the log, never to the client.
 - A backend may also implement `DataKeyGenerator` if its KMS has a native "generate data key" call.

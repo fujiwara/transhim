@@ -327,3 +327,20 @@ func TestNoMergingWithoutCache(t *testing.T) {
 		t.Errorf("backend called %d times, want 4", n)
 	}
 }
+
+// TestDecryptCacheInvalidatedByFailedDelete: when the backend fails to delete
+// a key, the key may be gone all the same, so its cached plaintexts go too.
+func TestDecryptCacheInvalidatedByFailedDelete(t *testing.T) {
+	e := newEnv(t, cacheOption(true))
+	dk := e.do(http.MethodPost, "/v1/transit-kms/datakey/plaintext/key1", "")
+	body := jsonBody(map[string]any{"ciphertext": dk.str("ciphertext")})
+	if n := e.decryptCalls(func() { e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", body) }); n != 0 {
+		t.Fatalf("backend called %d times, want 0: the cache is not warm", n)
+	}
+
+	e.backend.SetError(transhimtest.OpDeleteKey, transhim.ErrUpstream)
+	e.wantError(e.do(http.MethodDelete, "/v1/transit-kms/keys/key1", ""), 502, "upstream key service error")
+	// what the backend reported as a failure did delete the key
+	e.backend.RemoveKey("kms", "key1")
+	e.wantError(e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", body), 400, "encryption key not found")
+}

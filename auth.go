@@ -49,7 +49,9 @@ type AuthRequest struct {
 // for ErrUpstream, 500 otherwise).
 //
 // Clients such as Ceph RGW do not check whether an S3 user may use a given key
-// name. If that matters, the Authorizer or the Backend has to check it.
+// name. If that matters, check it here. A Backend can restrict which keys a
+// name may reach at all, but it is not called for requests answered from the
+// decrypt cache, so it cannot decide per request.
 type Authorizer func(ctx context.Context, req AuthRequest) error
 
 // StaticTokenAuthorizer returns an Authorizer that allows every operation to

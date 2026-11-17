@@ -484,8 +484,10 @@ func TestDeleteDuringLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(store.release)
-	if err := <-done; err != nil {
-		t.Fatalf("the decrypt in flight: %v", err) // it may still succeed
+	// the load found the key and then learned of its deletion: the key must
+	// not be used anymore
+	if err := <-done; !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Fatalf("the decrypt in flight: err = %v, want ErrKeyNotFound", err)
 	}
 	if n := hierarchical.CacheLen(b); n != 0 {
 		t.Fatalf("the deleted key is cached (%d entries)", n)
@@ -888,5 +890,92 @@ func TestLoadSurvivesCanceledRequest(t *testing.T) {
 	wg.Wait()
 	if _, d := f.rootCalls(); d != 1 {
 		t.Errorf("root Decrypt called %d times, want 1", d)
+	}
+}
+
+// TestRequestAfterDeleteDoesNotJoinStaleLoad: a request that arrives after a
+// key was deleted must not get the key from a load that started before the
+// deletion and is still running (the root KMS may take seconds).
+func TestRequestAfterDeleteDoesNotJoinStaleLoad(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	for _, name := range []string{bucket, "other"} {
+		if err := f.b.CreateKey(ctx, mountID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wk := encrypt(t, f.b, bucket, "p", "")
+	otherWK := encrypt(t, f.b, "other", "p", "")
+	cold, _ := hierarchical.New(f.root, rootKey, f.store)
+	f.root.SetDelay(300 * time.Millisecond)
+
+	// loads of both keys start: the store is read, the root KMS is slow
+	var wg sync.WaitGroup
+	wg.Go(func() { decrypt(t, cold, bucket, wk, "") })
+	otherErr := make(chan error, 1)
+	wg.Go(func() {
+		got, err := decrypt(t, cold, "other", otherWK, "")
+		if err == nil && string(got) != "p" {
+			err = errors.New("wrong plaintext")
+		}
+		otherErr <- err
+	})
+	for _, d := f.rootCalls(); d < 2; _, d = f.rootCalls() {
+		time.Sleep(time.Millisecond)
+	}
+	if err := cold.DeleteKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	// this request comes after the deletion and joins the running load
+	if _, err := decrypt(t, cold, bucket, wk, ""); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("Decrypt after DeleteKey: err = %v, want ErrKeyNotFound", err)
+	}
+	wg.Wait()
+	// deleting one key does not disturb the load of another
+	if err := <-otherErr; err != nil {
+		t.Errorf("Decrypt with another key during the deletion: %v", err)
+	}
+	if _, d := f.rootCalls(); d != 2 {
+		t.Errorf("root Decrypt called %d times, want 2", d)
+	}
+	if n := hierarchical.CacheLen(cold); n != 1 {
+		t.Errorf("%d keys cached, want only the other key", n)
+	}
+}
+
+// TestKeyRecreatedDuringLoad: if the key is deleted and created again while
+// its old version is being loaded, the new one is used.
+func TestKeyRecreatedDuringLoad(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	if err := f.b.CreateKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	old := encrypt(t, f.b, bucket, "p", "")
+	cold, _ := hierarchical.New(f.root, rootKey, f.store)
+	f.root.SetDelay(200 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cold.Decrypt(ctx, transhim.DecryptRequest{MountID: mountID, KeyName: bucket, Wrapped: old})
+		done <- err
+	}()
+	for _, d := f.rootCalls(); d == 0; _, d = f.rootCalls() {
+		time.Sleep(time.Millisecond)
+	}
+	if err := cold.DeleteKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if err := cold.CreateKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	// The old ciphertext must not decrypt. The load is repeated; depending on
+	// whether the new key is stored by then, it finds no key or the new one.
+	if err := <-done; !errors.Is(err, transhim.ErrKeyNotFound) && !errors.Is(err, transhim.ErrCiphertextMismatch) {
+		t.Errorf("Decrypt of old data: err = %v, want ErrKeyNotFound or ErrCiphertextMismatch", err)
+	}
+	fresh := encrypt(t, cold, bucket, "new", "")
+	if got, err := decrypt(t, cold, bucket, fresh, ""); err != nil || string(got) != "new" {
+		t.Errorf("Decrypt with the new key = %q, %v", got, err)
 	}
 }

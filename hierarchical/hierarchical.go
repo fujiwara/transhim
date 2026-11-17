@@ -23,6 +23,10 @@
 //   - Loading a key (first use, or after its cache entry expired) costs one
 //     KeyStore read and one root backend call. Requests for the same key that
 //     arrive meanwhile wait for that load instead of starting their own.
+//   - Data is encrypted with AES-256-GCM and a random 96-bit nonce, which is
+//     sound for up to about 2^32 encryptions per key. A bucket key encrypts
+//     one data key per object written, so this is far away; there is no key
+//     rotation that would lift the limit.
 //   - A key is not always deleted when its bucket is: see docs/compat.md.
 //     Orphaned intermediate keys can stay behind in the KeyStore.
 package hierarchical
@@ -95,14 +99,27 @@ type Backend struct {
 
 	mu    sync.Mutex
 	cache map[keyID]cachedKey
-	// gen counts deletions. A key loaded while a deletion happened is not
-	// cached: it may be the one that was just deleted.
+	// gen counts deletions. A key that CreateKey stored while a deletion
+	// happened is not cached: it may be the one that was just deleted. (Loads
+	// are told about the deletion of their key through loading.)
 	gen       uint64
 	nextSweep time.Time
 
 	// loads merges concurrent loads of the same key into one.
 	loads singleflight.Group
+	// loading holds the keys being loaded, so that DeleteKey can tell a load
+	// that its key was deleted meanwhile. There is at most one load per key.
+	loading map[keyID]*loadState
 }
+
+type loadState struct {
+	// deleted is set by DeleteKey. Guarded by Backend.mu.
+	deleted bool
+}
+
+// maxLoadAttempts bounds how often a load is repeated because its key was
+// deleted while it ran.
+const maxLoadAttempts = 3
 
 var (
 	_ transhim.Backend      = (*Backend)(nil)
@@ -132,6 +149,7 @@ func New(root transhim.Backend, rootKeyName string, store KeyStore, opts ...Opti
 		ttl:         DefaultKeyCacheTTL,
 		now:         time.Now,
 		cache:       map[keyID]cachedKey{},
+		loading:     map[keyID]*loadState{},
 	}
 	for _, opt := range opts {
 		if err := opt(b); err != nil {
@@ -193,12 +211,17 @@ func (b *Backend) cached(id keyID) (cipher.AEAD, uint64) {
 
 // remember caches a key, unless a deletion happened since gen was read.
 func (b *Backend) remember(id keyID, aead cipher.AEAD, gen uint64) {
-	if b.ttl == 0 {
-		return
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if gen != b.gen {
+		return
+	}
+	b.rememberLocked(id, aead)
+}
+
+// rememberLocked caches a key. The caller holds b.mu.
+func (b *Backend) rememberLocked(id keyID, aead cipher.AEAD) {
+	if b.ttl == 0 {
 		return
 	}
 	now := b.now()
@@ -229,21 +252,52 @@ func (b *Backend) key(ctx context.Context, mountID, keyName string) (cipher.AEAD
 	// The load must not die with the request that happened to start it, so
 	// it does not inherit that request's cancellation.
 	flightKey := fmt.Sprintf("%d:%s%s", len(mountID), mountID, keyName)
-	v, err, _ := b.loads.Do(flightKey, func() (any, error) {
-		return b.load(context.WithoutCancel(ctx), mountID, keyName)
-	})
-	if err != nil {
-		return nil, err
+	for range maxLoadAttempts {
+		v, err, _ := b.loads.Do(flightKey, func() (any, error) {
+			return b.load(context.WithoutCancel(ctx), mountID, keyName)
+		})
+		if err != nil {
+			return nil, err
+		}
+		// A key that was deleted while it was being loaded must not be handed
+		// out: a request that arrived after the deletion may be waiting for
+		// this very load, and would use the deleted key. Load again instead,
+		// which finds the key gone (or a new one created since).
+		if res := v.(loadResult); !res.deleted {
+			return res.aead, nil
+		}
 	}
-	return v.(cipher.AEAD), nil
+	return nil, fmt.Errorf("hierarchical: key %q was deleted repeatedly while it was being loaded", keyName)
 }
 
-// load fetches the intermediate key from the KeyStore and unwraps it.
-func (b *Backend) load(ctx context.Context, mountID, keyName string) (cipher.AEAD, error) {
+type loadResult struct {
+	aead cipher.AEAD
+	// deleted reports that DeleteKey ran for the key during the load.
+	deleted bool
+}
+
+// load fetches the intermediate key from the KeyStore and unwraps it. It runs
+// at most once at a time per key.
+func (b *Backend) load(ctx context.Context, mountID, keyName string) (loadResult, error) {
 	id := keyID{mountID, keyName}
+	state := &loadState{}
+	b.mu.Lock()
+	b.loading[id] = state
+	b.mu.Unlock()
+	aead, err := b.loadKey(ctx, id)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.loading, id)
+	if err == nil && !state.deleted {
+		b.rememberLocked(id, aead)
+	}
+	return loadResult{aead: aead, deleted: state.deleted}, err
+}
+
+func (b *Backend) loadKey(ctx context.Context, id keyID) (cipher.AEAD, error) {
+	mountID, keyName := id.mountID, id.name
 	// a load that finished just before this one started may have cached it
-	aead, gen := b.cached(id)
-	if aead != nil {
+	if aead, _ := b.cached(id); aead != nil {
 		return aead, nil
 	}
 	stored, err := b.store.Get(ctx, mountID, keyName)
@@ -263,12 +317,7 @@ func (b *Backend) load(ctx context.Context, mountID, keyName string) (cipher.AEA
 	if len(raw) != intermediateKeySize {
 		return nil, fmt.Errorf("hierarchical: stored intermediate key has %d bytes, want %d", len(raw), intermediateKeySize)
 	}
-	aead, err = newAEAD(raw)
-	if err != nil {
-		return nil, err
-	}
-	b.remember(id, aead, gen)
-	return aead, nil
+	return newAEAD(raw)
 }
 
 // Encrypt implements transhim.Backend. It returns an error wrapping
@@ -358,9 +407,13 @@ func (b *Backend) CreateKey(ctx context.Context, mountID, keyName string) error 
 func (b *Backend) DeleteKey(ctx context.Context, mountID, keyName string) error {
 	err := b.store.Delete(ctx, mountID, keyName)
 	// Forget the key even if the store failed: it may be gone all the same.
+	id := keyID{mountID, keyName}
 	b.mu.Lock()
 	b.gen++
-	delete(b.cache, keyID{mountID, keyName})
+	delete(b.cache, id)
+	if state := b.loading[id]; state != nil {
+		state.deleted = true
+	}
 	b.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("hierarchical: delete key from store: %w", err)

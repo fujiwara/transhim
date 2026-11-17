@@ -82,8 +82,12 @@ func WithMaxBodySize(n int64) Option {
 
 // WithDecryptCache enables the decrypt cache, which is off by default. It
 // answers repeated decrypt requests for the same ciphertext, key name, and
-// context without calling the backend. Requests are still authorized, and
-// failures are never cached. See DecryptCacheConfig for what the TTL means for
+// context without calling the backend. Concurrent requests of that kind share
+// one backend call. Requests are still authorized, and failures are never
+// cached.
+//
+// Since the backend is not called for every request, it cannot be the place
+// where access is decided per request: do that in the Authorizer. See DecryptCacheConfig for what the TTL means for
 // revocation.
 func WithDecryptCache(cfg DecryptCacheConfig) Option {
 	return func(c *config) error {
@@ -648,13 +652,18 @@ func (s *Server) handleKeyDelete(ctx context.Context, req *request) (*result, er
 			return nil, badRequest("deletion is not allowed for this key")
 		}
 	}
+	var err error
 	if m.lifecycle != nil {
-		if err := m.lifecycle.DeleteKey(ctx, m.id, req.keyName); err != nil {
-			return nil, err
-		}
+		err = m.lifecycle.DeleteKey(ctx, m.id, req.keyName)
 	}
+	// Also when the backend reports a failure: the key may be gone all the
+	// same (a timeout after the delete took effect), and then its cached
+	// plaintexts must not outlive it.
 	if s.cache != nil {
 		s.cache.invalidate(req.keyID())
+	}
+	if err != nil {
+		return nil, err
 	}
 	if m.requireDeletionAllowed {
 		s.mu.Lock()
