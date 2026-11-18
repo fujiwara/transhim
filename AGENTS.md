@@ -6,7 +6,7 @@ transhim is a Go library for building Vault Transit compatible servers that dele
 
 - [docs/DESIGN.md](docs/DESIGN.md): the design document: goals and non-goals, the HTTP API, the envelope and AAD formats, the Go interfaces, what was deferred (D1...), and the reasons. Read it before changing behavior. It is for contributors; user documentation does not link to it.
 - [docs/compat.md](docs/compat.md): what Ceph RGW was observed to send and how it reacts. The source of truth for client behavior.
-- [docs/server.md](docs/server.md), [docs/rgw.md](docs/rgw.md), [README.md](README.md): user documentation. Keep them in step with the code.
+- [docs/server.md](docs/server.md), [docs/api.md](docs/api.md), [docs/rgw.md](docs/rgw.md), [README.md](README.md): user documentation. Keep them in step with the code.
 
 ## Layout
 
