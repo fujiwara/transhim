@@ -1,5 +1,10 @@
 name: test
-on: [push, pull_request]
+# Branches are tested through their pull request; a push trigger for them
+# would run everything twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 jobs:
