@@ -1,5 +1,16 @@
 # Changelog
 
+## [v0.2.0](https://github.com/fujiwara/transhim/compare/v0.1.0...v0.2.0) - 2026-11-18
+
+- Require transhim v0.1.0 in the example modules by @fujiwara in https://github.com/fujiwara/transhim/pull/6
+- Add a KeyStore conformance suite and an SQL key store example by @fujiwara in https://github.com/fujiwara/transhim/pull/8
+- Pass the request context to authorizers and audit hooks by @fujiwara in https://github.com/fujiwara/transhim/pull/11
+- Add a guide to writing a production server by @fujiwara in https://github.com/fujiwara/transhim/pull/10
+- Support Ceph 21 (umbrella), drop Ceph 18 (reef) by @fujiwara in https://github.com/fujiwara/transhim/pull/14
+- Document the HTTP API by @fujiwara in https://github.com/fujiwara/transhim/pull/13
+- Log the request context in the example servers by @fujiwara in https://github.com/fujiwara/transhim/pull/12
+- Bump postgres from 18.1 to 18.6 by @dependabot[bot] in https://github.com/fujiwara/transhim/pull/9
+
 ## [v0.1.0](https://github.com/fujiwara/transhim/commits/v0.1.0) - 2026-11-17
 
 The first release. transhim is a Go framework for building servers that speak the HashiCorp Vault Transit HTTP API while delegating the cryptography to a backend you provide, typically a cloud KMS. Its first target is Ceph RGW server-side encryption (SSE-KMS and SSE-S3).
