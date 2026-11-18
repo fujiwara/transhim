@@ -191,6 +191,33 @@ $ sops decrypt secrets.enc.yaml
 - **Errors reach the user.** sops prints the status and transhim's message (`Code: 403. Errors: * permission denied`).
 - **`5xx` is retried.** Vault's Go client sends a request up to three times, about three seconds in all, when the answer is `502` or `503`. A failing key service therefore gets three calls per sops invocation.
 
+### RustFS
+
+[RustFS](https://github.com/rustfs/rustfs) with its `vault-transit` KMS backend **does not work against transhim**, and cannot with transhim alone: it needs a KV v2 secrets engine at the same address. Observed with RustFS 1.0.6 (§12 item 5).
+
+How it was looked at: RustFS in a container (`RUSTFS_KMS_ENABLE=true`, `RUSTFS_KMS_BACKEND=vault-transit`, `RUSTFS_KMS_VAULT_ADDRESS`, `RUSTFS_KMS_VAULT_TOKEN`; the Transit mount defaults to `transit`), first with `tools/vaultrec` in front of OpenBao 2.7.2, then pointed at a transhim server. Source references are to `crates/kms/src/backends/vault_transit.rs` at the tag `1.0.6`.
+
+What RustFS sends to OpenBao:
+
+| request | sent when | against transhim |
+|---|---|---|
+| `GET /v1/auth/token/lookup-self` | at startup | `404`. RustFS goes on without it (it then does not renew the token) |
+| `LIST {prefix}/keys` | at startup, as the health check, and again later | `404 unsupported path`. **RustFS does not start**: only a `404` without a message, as Vault gives for an empty mount, passes. Nothing below was reached |
+| `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | would be `404`, which RustFS takes as a missing key (`KMS.NotFoundException`) |
+| `GET` and `POST /v1/secret/data/rustfs/kms/transit-metadata/{name}` | with the first use of a key: RustFS keeps a record per key (state, usage, tags) in KV v2 and creates it with check-and-set | not Transit, and not served. The write is mandatory: by the source, a key is not used if it fails |
+| `POST {prefix}/keys/rustfs-internal-kms-probe` with `{"type":"aes256-gcm96"}` | at startup: a key of its own for the health probe | would be accepted |
+| `POST {prefix}/encrypt/{name}` with `{"plaintext":"...","associated_data":"..."}` | an encrypted object is written | **`associated_data` is ignored**; see below |
+| `POST {prefix}/decrypt/{name}` with `{"ciphertext":"...","associated_data":"..."}` | an encrypted object is read | |
+
+What that shows:
+
+- **No `datakey`.** RustFS makes the data key itself and wraps it with `encrypt`, as sops does. Keys are not created on demand: an S3 request naming a key that Transit does not have fails with `KMS.NotFoundException`. SSE-S3 uses the default key, named `default` unless `RUSTFS_KMS_DEFAULT_KEY_ID` is set.
+- **The object is bound with `associated_data`, not `context`.** Its value is the base64 of a JSON object: `{"<bucket>":"<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries. transhim ignores the field, so against transhim that binding would be silently lost: a ciphertext would decrypt for any object. This has to be closed before RustFS is served at all.
+- **It reads key metadata.** `GET keys/{name}` is deserialized into the full shape of Vault's answer (`type`, `keys`, `latest_version`, and so on), and the source has calls for `rotate`, `rewrap`, `config`, and `DELETE` as well, for its key management API.
+- **Requests** come from the Rust client `vaultrs`: `POST` and `LIST`, an `X-Vault-Request: true` header, no `Content-Type`.
+
+To serve RustFS, transhim would need `LIST keys`, `GET keys/{name}` in Vault's shape, and `associated_data` bound into ciphertexts, and the deployment would still need a real Vault or OpenBao for the KV v2 records, with a proxy sending the Transit paths to transhim. None of this exists.
+
 ## Not covered yet
 
-- §12 items 3 and 5 (go-kms-wrapping, RustFS): deferred with their clients (DESIGN.md §3, D9).
+- §12 item 3 (go-kms-wrapping): deferred with its clients (DESIGN.md §3, D9).
