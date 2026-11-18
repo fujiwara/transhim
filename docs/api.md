@@ -206,7 +206,7 @@ For a client that only uses the endpoints above, these are the differences in be
 
 | | Vault, OpenBao | transhim |
 |---|---|---|
-| answer to `keys/{name}` and `keys/{name}/config` | `200` with the key's metadata | `204`, no body. Ceph RGW 18 and 19 need this: they take a body in the answer to `config` as a failure and then never delete the key |
+| answer to `keys/{name}` and `keys/{name}/config` | `200` with the key's metadata | `204`, no body. Ceph RGW 19 (squid) needs this to delete bucket keys: it takes a body in the answer to `config` as a failure and then does not send the `DELETE`, a bug in RGW ([compat.md](compat.md)). Encrypting and decrypting are not affected |
 | `keys/{name}` with `exportable: true` | accepted | `400` |
 | `keys/{name}/config` on a missing key | `400` | `204` |
 | `DELETE` of a missing key | `400` | `204` |
