@@ -259,6 +259,30 @@ func TestEncrypt(t *testing.T) {
 			t.Errorf("got %d %q", r.status, r.body)
 		}
 	})
+	// A client that sends associated_data counts on it being bound into the
+	// ciphertext. It is refused, never silently dropped.
+	t.Run("associated_data is refused", func(t *testing.T) {
+		const msg = "associated_data is not supported"
+		before := e.backend.Calls(transhimtest.OpEncrypt) + e.backend.Calls(transhimtest.OpDecrypt)
+		enc := jsonBody(map[string]any{"plaintext": b64("hello"), "associated_data": b64("object-1")})
+		e.wantError(e.do(http.MethodPost, "/v1/transit-kms/encrypt/key1", enc), 400, msg)
+
+		r := e.do(http.MethodPost, "/v1/transit-kms/encrypt/key1", jsonBody(map[string]any{"plaintext": b64("hello")}))
+		if r.status != http.StatusOK {
+			t.Fatalf("encrypt: %d %q", r.status, r.body)
+		}
+		dec := jsonBody(map[string]any{"ciphertext": r.str("ciphertext"), "associated_data": b64("object-1")})
+		e.wantError(e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", dec), 400, msg)
+		if got := e.backend.Calls(transhimtest.OpEncrypt) + e.backend.Calls(transhimtest.OpDecrypt); got != before+1 {
+			t.Errorf("backend calls = %d, want %d: a refused request must not reach the backend", got-before, 1)
+		}
+
+		// absent and empty mean the same: not given
+		empty := jsonBody(map[string]any{"ciphertext": r.str("ciphertext"), "associated_data": ""})
+		if d := e.do(http.MethodPost, "/v1/transit-kms/decrypt/key1", empty); d.status != http.StatusOK {
+			t.Errorf("decrypt with an empty associated_data: %d %q", d.status, d.body)
+		}
+	})
 	t.Run("too large", func(t *testing.T) {
 		body := jsonBody(map[string]any{"plaintext": b64(strings.Repeat("x", transhim.DefaultMaxPlaintextSize+1))})
 		e.wantError(e.do(http.MethodPost, "/v1/transit-kms/encrypt/key1", body), 400, "plaintext too large")

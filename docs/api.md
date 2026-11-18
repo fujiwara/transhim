@@ -132,6 +132,7 @@ Unwraps a ciphertext that `datakey` or `encrypt` returned.
 |---|---|---|
 | `ciphertext` | string, required | missing: `400 missing ciphertext to decrypt` |
 | `context` | base64, optional | must be the one given when the ciphertext was made |
+| `associated_data` | base64 | not supported: `400 associated_data is not supported`, unless it is empty |
 
 | `data` field | |
 |---|---|
@@ -152,6 +153,7 @@ Wraps a plaintext. Ceph RGW does not use it.
 | `plaintext` | base64, required | missing: `400 missing plaintext to encrypt`. More than the mount's limit (`WithMaxPlaintextSize`, 4096 bytes by default): `400 plaintext too large` |
 | `context` | base64, optional | bound into the ciphertext |
 | `key_version` | number | not supported: ignored, with a warning in the answer |
+| `associated_data` | base64 | not supported: `400 associated_data is not supported`, unless it is empty |
 
 | `data` field | |
 |---|---|
@@ -215,7 +217,8 @@ For a client that only uses the endpoints above, these are the differences in be
 | `context` on a key that is not derived | ignored | always bound: decrypting needs the same context |
 | a key that needs a `context`, without one | `400` | no such requirement |
 | wrong key, wrong context, tampered ciphertext | `400` with the cipher's error message | `400 invalid ciphertext` |
-| key types, `convergent_encryption`, `nonce`, `associated_data` | supported | ignored |
+| `associated_data` in `encrypt` and `decrypt` | bound into the ciphertext (AEAD key types) | `400 associated_data is not supported`. Use `context`, which transhim always binds |
+| key types, `convergent_encryption`, `nonce` | supported | ignored |
 | key versions, rotation, `min_decryption_version` | supported | not there; rotation is the KMS's business |
 
 The reference answers were recorded from OpenBao 2.7.2 (see [compat.md](compat.md)).

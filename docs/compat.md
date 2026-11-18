@@ -206,13 +206,13 @@ What RustFS sends to OpenBao:
 | `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | would be `404`, which RustFS takes as a missing key (`KMS.NotFoundException`) |
 | `GET` and `POST /v1/secret/data/rustfs/kms/transit-metadata/{name}` | with the first use of a key: RustFS keeps a record per key (state, usage, tags) in KV v2 and creates it with check-and-set | not Transit, and not served. The write is mandatory: by the source, a key is not used if it fails |
 | `POST {prefix}/keys/rustfs-internal-kms-probe` with `{"type":"aes256-gcm96"}` | at startup: a key of its own for the health probe | would be accepted |
-| `POST {prefix}/encrypt/{name}` with `{"plaintext":"...","associated_data":"..."}` | an encrypted object is written | **`associated_data` is ignored**; see below |
-| `POST {prefix}/decrypt/{name}` with `{"ciphertext":"...","associated_data":"..."}` | an encrypted object is read | |
+| `POST {prefix}/encrypt/{name}` with `{"plaintext":"...","associated_data":"..."}` | an encrypted object is written | `400 associated_data is not supported`; see below |
+| `POST {prefix}/decrypt/{name}` with `{"ciphertext":"...","associated_data":"..."}` | an encrypted object is read | the same |
 
 What that shows:
 
 - **No `datakey`.** RustFS makes the data key itself and wraps it with `encrypt`, as sops does. Keys are not created on demand: an S3 request naming a key that Transit does not have fails with `KMS.NotFoundException`. SSE-S3 uses the default key, named `default` unless `RUSTFS_KMS_DEFAULT_KEY_ID` is set.
-- **The object is bound with `associated_data`, not `context`.** Its value is the base64 of a JSON object: `{"<bucket>":"<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries. transhim ignores the field, so against transhim that binding would be silently lost: a ciphertext would decrypt for any object. This has to be closed before RustFS is served at all.
+- **The object is bound with `associated_data`, not `context`.** Its value is the base64 of a JSON object: `{"<bucket>":"<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries. transhim binds `context` only and refuses a request with `associated_data` (`400`), rather than accept it and drop the binding without anyone noticing.
 - **It reads key metadata.** `GET keys/{name}` is deserialized into the full shape of Vault's answer (`type`, `keys`, `latest_version`, and so on), and the source has calls for `rotate`, `rewrap`, `config`, and `DELETE` as well, for its key management API.
 - **Requests** come from the Rust client `vaultrs`: `POST` and `LIST`, an `X-Vault-Request: true` header, no `Content-Type`.
 

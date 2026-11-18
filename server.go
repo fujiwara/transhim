@@ -524,9 +524,15 @@ func (s *Server) handleDataKey(ctx context.Context, req *request, body []byte) (
 }
 
 type encryptBody struct {
-	Plaintext  *string `json:"plaintext"`
-	KeyVersion int     `json:"key_version"`
+	Plaintext      *string `json:"plaintext"`
+	KeyVersion     int     `json:"key_version"`
+	AssociatedData string  `json:"associated_data"`
 }
+
+// errAssociatedData refuses Vault's associated_data. A client that sends it
+// relies on it being bound into the ciphertext, like the context; ignoring
+// it would drop that binding without anyone noticing.
+var errAssociatedData = badRequest("associated_data is not supported")
 
 type encryptData struct {
 	Ciphertext string `json:"ciphertext"`
@@ -537,6 +543,9 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 	var in encryptBody
 	if err := decodeBody(body, &in); err != nil {
 		return nil, err
+	}
+	if in.AssociatedData != "" {
+		return nil, errAssociatedData
 	}
 	if in.Plaintext == nil {
 		return nil, badRequest("missing plaintext to encrypt")
@@ -572,7 +581,8 @@ func (s *Server) handleEncrypt(ctx context.Context, req *request, body []byte) (
 }
 
 type decryptBody struct {
-	Ciphertext *string `json:"ciphertext"`
+	Ciphertext     *string `json:"ciphertext"`
+	AssociatedData string  `json:"associated_data"`
 }
 
 type decryptData struct {
@@ -583,6 +593,9 @@ func (s *Server) handleDecrypt(ctx context.Context, req *request, body []byte) (
 	var in decryptBody
 	if err := decodeBody(body, &in); err != nil {
 		return nil, err
+	}
+	if in.AssociatedData != "" {
+		return nil, errAssociatedData
 	}
 	if in.Ciphertext == nil {
 		return nil, badRequest("missing ciphertext to decrypt")
