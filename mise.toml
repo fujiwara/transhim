@@ -1,0 +1,3 @@
+# Tools the workflows need besides Go and docker.
+[tools]
+sops = "3.13.3" # integration/, TestSops

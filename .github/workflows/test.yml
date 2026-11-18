@@ -72,6 +72,33 @@ jobs:
         run: |
           docker compose logs --tail 200 ceph
 
+  # sops as a second Transit client (integration/, TestSops).
+  sops:
+    name: Interop (sops)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27"
+          cache-dependency-path: integration/go.sum
+
+      # sops, pinned in mise.toml
+      - name: Set up mise
+        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+
+      - name: sops version
+        run: |
+          sops --version --disable-version-check
+
+      - name: Interop Test
+        working-directory: integration
+        run: |
+          go test -race -count=1 -v -run 'TestSops' ./...
+
   # The AWS KMS example, tested against the AWS Emulator.
   awskms:
     name: AWS KMS example

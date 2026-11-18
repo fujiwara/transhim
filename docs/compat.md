@@ -171,6 +171,26 @@ What follows from it:
 - **SSE-S3 key operations.** If `POST keys/{name}` fails, the PutObject that needed the key fails (`500`) and stores nothing. If `config` or `DELETE` fail, DeleteBucket succeeds all the same and the key is orphaned, as described above.
 - Unencrypted objects are not affected by any of this.
 
+## Other clients
+
+### sops
+
+[sops](https://github.com/getsops/sops) with a `hc_vault_transit` key works against transhim. Observed with sops 3.13.3 (`integration/`, `TestSops` and `TestSopsFailures`); what it sends to OpenBao 2.7.2 was recorded with `tools/vaultrec` (sops 3.12.2) and is the same.
+
+```console
+$ export VAULT_TOKEN=...   # what the server's authorizer expects
+$ sops encrypt --hc-vault-transit https://transhim.example.com:8200/v1/transit/keys/my-key secrets.yaml > secrets.enc.yaml
+$ sops decrypt secrets.enc.yaml
+```
+
+- **The key URI** is the server's address, the mount's prefix, `/keys/`, and the key name. sops takes what stands between `/v1/` and `/keys/` as the engine path, so the mount's prefix must start with `/v1/`.
+- **What it calls.** `PUT {prefix}/encrypt/{name}` with `{"plaintext":"<base64 of a 32 byte data key>"}` when a file is encrypted, `PUT {prefix}/decrypt/{name}` with `{"ciphertext":"vault:v1:..."}` when it is decrypted; `sops rotate` does both. Nothing else: no `keys/`, `auth/`, or `sys/` call. It reads `data.ciphertext` and `data.plaintext`, and stores the ciphertext in the file as it is.
+- **It uses Vault's Go client**: `PUT` instead of `POST`, an `X-Vault-Request: true` header, no `Content-Type`, the token from `VAULT_TOKEN` or `~/.vault-token`.
+- **No context.** The ciphertext is bound to the mount ID and the key name only.
+- **The key must exist.** With `encrypt` on a missing key, Vault creates the key; transhim answers `400 encryption key not found`, and sops fails with that message.
+- **Errors reach the user.** sops prints the status and transhim's message (`Code: 403. Errors: * permission denied`).
+- **`5xx` is retried.** Vault's Go client sends a request up to three times, about three seconds in all, when the answer is `502` or `503`. A failing key service therefore gets three calls per sops invocation.
+
 ## Not covered yet
 
 - §12 items 3 and 5 (go-kms-wrapping, RustFS): deferred with their clients (DESIGN.md §3, D9).
