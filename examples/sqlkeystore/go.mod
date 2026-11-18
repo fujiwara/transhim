@@ -3,7 +3,7 @@ module github.com/fujiwara/transhim/examples/sqlkeystore
 go 1.26.0
 
 require (
-	github.com/fujiwara/transhim v0.1.0
+	github.com/fujiwara/transhim v0.2.0
 	github.com/jackc/pgx/v5 v5.13.0
 	modernc.org/sqlite v1.62.0
 )

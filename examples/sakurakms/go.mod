@@ -3,7 +3,7 @@ module github.com/fujiwara/transhim/examples/sakurakms
 go 1.26.0
 
 require (
-	github.com/fujiwara/transhim v0.1.0
+	github.com/fujiwara/transhim v0.2.0
 	github.com/ogen-go/ogen v1.25.0
 	github.com/sacloud/sacloud-sdk-go v0.7.0
 	github.com/sacloud/sakumock v0.14.0
