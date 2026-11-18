@@ -1,6 +1,6 @@
 # Using transhim with Ceph RGW
 
-This guide configures Ceph RGW server-side encryption (SSE-KMS and SSE-S3) against a transhim server. It applies to Ceph 18 (reef), 19 (squid), and 20 (tentacle), the releases transhim is tested with. What RGW sends, and how it reacts when things fail, is recorded in [compat.md](compat.md).
+This guide configures Ceph RGW server-side encryption (SSE-KMS and SSE-S3) against a transhim server. It applies to Ceph 19 (squid), 20 (tentacle), and 21 (umbrella), the releases transhim is tested with. What RGW sends, and how it reacts when things fail, is recorded in [compat.md](compat.md).
 
 ## The two mounts
 
@@ -54,7 +54,7 @@ Notes on these settings:
 
 - **`secret_engine = transit`, with nothing after it.** RGW also has a legacy mode that exports keys from Vault, which transhim does not serve. RGW uses it only if the prefix ends with `/export/encryption-key` or a `compat=` parameter asks for it. With the prefixes above it is off.
 - **`prefix`** must be the mount's prefix exactly.
-- **The token file** holds the token the server's authorizer expects. RGW refuses to read it if group or others can access it (tentacle accepts up to `0740`): make it `0600`, owned by the user RGW runs as.
+- **The token file** holds the token the server's authorizer expects. RGW refuses to read it if group or others can access it (tentacle and umbrella accept up to `0740`): make it `0600`, owned by the user RGW runs as.
 - **TLS.** `rgw_crypt_vault_verify_ssl` and `rgw_crypt_sse_s3_vault_verify_ssl` default to `true`; keep them. `*_ssl_cacert` is only needed for a private CA. For mutual TLS there are `*_ssl_clientcert` and `*_ssl_clientkey`; the server sees the client certificate in `AuthRequest.TLS`.
 - **`rgw_crypt_sse_s3_key_template`** (default `%bucket_id`) sets the per-bucket key name. Leave it alone unless you have a reason: changing it on a running cluster makes RGW ask for keys under new names.
 - **`rgw_crypt_require_ssl`** (default `true`) is about the S3 side: RGW rejects SSE requests that reach it over plain HTTP. Turn it off only for tests, or when TLS ends at a proxy in front of RGW.
@@ -85,7 +85,7 @@ This is best effort. A key stays behind in the `KeyStore` when:
 
 Find orphans by comparing the keys in your `KeyStore` with the bucket markers RGW knows (`radosgw-admin bucket stats`; the default key name is the marker).
 
-On reef and squid, this deletion only works because transhim answers key requests without a body. Against a real Vault or OpenBao those releases never delete a bucket key.
+On squid (up to 19.2.7 at least), this deletion only works because transhim answers key requests without a body. Against a real Vault or OpenBao that release never deletes a bucket key ([Ceph issue 65626](https://tracker.ceph.com/issues/65626), fixed in tentacle).
 
 ### The `KeyStore` is as important as the data
 
@@ -96,12 +96,13 @@ The root key name and the mount ID are bound into the stored keys. Changing eith
 ### Slow or failing KMS
 
 - RGW calls `decrypt` on every read of an encrypted object, including HeadObject and every part of a multipart upload. Enable the decrypt cache (`WithDecryptCache`) unless your KMS is fast and cheap. Requests for the same key that arrive together share one KMS call.
+- Umbrella adds a cache of its own for SSE-KMS keys (`rgw_crypt_s3_kms_cache_enabled`, on by default, 60 seconds). It was not seen working in the test setup; see [compat.md](compat.md). Do not count on it in place of the decrypt cache.
 - RGW does not time out waiting for the Transit endpoint and does not retry. A slow KMS makes S3 requests slow; each one holds an RGW request thread while it waits.
 - RGW fails closed. If the Transit endpoint fails, the S3 request fails, and nothing is stored unencrypted or handed out. The S3 client sees `400 InvalidArgument` for a missing key, `403 AccessDenied` if the authorizer or the KMS denies the request, and `500` or `503` for outages.
 
 ### Revocation takes up to the cache TTLs
 
-Two caches hold key material in memory: the decrypt cache of the server, and the intermediate key cache of the hierarchical backend (`WithKeyCacheTTL`). A key that is disabled directly in the KMS, or deleted through another transhim instance, stays usable until those entries expire. A key deleted through the same instance is dropped from both at once.
+Two caches hold key material in memory: the decrypt cache of the server, and the intermediate key cache of the hierarchical backend (`WithKeyCacheTTL`). On umbrella, RGW's own SSE-KMS key cache (`rgw_crypt_s3_kms_cache_positive_ttl`, 60 seconds by default) comes on top where it is in effect. A key that is disabled directly in the KMS, or deleted through another transhim instance, stays usable until those entries expire. A key deleted through the same instance is dropped from both at once.
 
 ### Several instances
 

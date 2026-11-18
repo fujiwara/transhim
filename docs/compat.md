@@ -21,7 +21,7 @@ $ jq -r -f compat/summary.jq testdata/capture/ceph-v20.2.5.jsonl
 
 | component | versions |
 |---|---|
-| Ceph RGW | 18.2.8 (reef), 19.2.7 (squid), 20.2.5 (tentacle) |
+| Ceph RGW | 19.2.7 (squid), 20.2.5 (tentacle), 21.2.0 (umbrella) |
 | reference Transit | OpenBao 2.7.2, dev mode |
 | S3 client | aws-cli 2.36.44 |
 
@@ -36,17 +36,17 @@ RGW calls exactly these five endpoints, on all three releases. It never calls `e
 | request | body | sent when |
 |---|---|---|
 | `POST {prefix}/datakey/plaintext/{name}` | `{"context":"<base64>"}` | an encrypted object is written: PutObject, CreateMultipartUpload, CopyObject destination |
-| `POST {prefix}/decrypt/{name}` | `{"context":"<base64>","ciphertext":"vault:v1:..."}` | an encrypted object is read: GetObject (also ranged), HeadObject, each UploadPart, CopyObject source; on tentacle also CompleteMultipartUpload |
+| `POST {prefix}/decrypt/{name}` | `{"context":"<base64>","ciphertext":"vault:v1:..."}` | an encrypted object is read: GetObject (also ranged), HeadObject, each UploadPart, CopyObject source; on tentacle and umbrella also CompleteMultipartUpload |
 | `POST {prefix}/keys/{name}` | `{"type":"chacha20-poly1305","derived":true}` | SSE-S3 only: the first encrypted write to a bucket |
 | `POST {prefix}/keys/{name}/config` | `{"deletion_allowed":true}` | SSE-S3 only: DeleteBucket of a bucket that has a key |
 | `DELETE {prefix}/keys/{name}` | none | SSE-S3 only: right after `config` |
 
 Details that matter to an implementation:
 
-- **Headers.** RGW sends `Accept: */*`, `Content-Length`, and `X-Vault-Token`. There is **no `Content-Type`**. `X-Vault-Token` is sent **twice** with the same value (a duplicated `append_header` call; fixed on Ceph `main`, still present in 20.2.5). A server must take the first value and must not require a content type.
+- **Headers.** RGW sends `Accept: */*`, `Content-Length`, and `X-Vault-Token`. Squid and tentacle send **no `Content-Type`**, and send `X-Vault-Token` **twice** with the same value (a duplicated `append_header` call). Umbrella sends `Content-Type: application/json` and the token once. A server must take the first value and must not require a content type.
 - **Methods.** Only `POST` and `DELETE`. `PUT` is never used.
 - **`context`** is always present. It is the base64 of a JSON object: `{"aws:s3:arn":"arn:aws:s3::<owner>:<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries if any. RGW stores it with the object and sends the identical value on every decrypt. CopyObject decrypts with the source object's context and requests a new data key with the destination's.
-- **The context can be forged with SSE-KMS.** An entry `aws:s3:arn` in the client's `x-amz-server-side-encryption-context` replaces RGW's: the S3 user can name any object there, on all three releases. With SSE-S3 the client has no say: RGW rejects a PutObject that carries an encryption context (`400 InvalidArgument`) without calling the Transit endpoint. So the context tells a server which object an SSE-S3 request is for; for SSE-KMS it only says what the S3 user claims (`integration/`, `TestRGWContext`).
+- **The context can be forged with SSE-KMS.** An entry `aws:s3:arn` in the client's `x-amz-server-side-encryption-context` replaces RGW's: the S3 user can name any object there, on all three releases (squid, tentacle, umbrella). With SSE-S3 the client has no say: RGW rejects a PutObject that carries an encryption context (`400 InvalidArgument`) without calling the Transit endpoint. So the context tells a server which object an SSE-S3 request is for; for SSE-KMS it only says what the S3 user claims (`integration/`, `TestRGWContext`).
 - **`bits`** is never sent; RGW relies on the 256-bit default.
 - **Response fields read.** `data.plaintext` and `data.ciphertext` from `datakey`, `data.plaintext` from `decrypt`. Nothing else is read (`key_version`, `request_id`, and the other envelope fields are ignored). Responses to `keys/...` calls are expected to be empty; see below.
 - **Key names.** For SSE-KMS it is the client's key ID, verbatim. RGW itself rejects a key ID containing `/` (400 `InvalidArgument`) without calling Vault, and rejects `aws:kms` without a key ID. For SSE-S3 it is `rgw_crypt_sse_s3_key_template` expanded; the default `%bucket_id` gives the bucket marker, e.g. `1434f035-2747-4d60-a14f-5a0efa651729.4126.2`. The template may also use `%owner_id`.
@@ -64,10 +64,13 @@ OpenBao (and Vault) answer `POST keys/{name}` and `POST keys/{name}/config` with
 
 | RGW | `POST keys/{name}` has a body | `POST keys/{name}/config` has a body |
 |---|---|---|
-| 18.2.8, 19.2.7 | logs an error, continues | **treats it as a failure and never sends `DELETE`** |
+| 19.2.7 | logs an error, continues | **treats it as a failure and never sends `DELETE`** |
 | 20.2.5 | logs an error, continues | continues |
+| 21.2.0 | continues | continues |
 
-With a current OpenBao, reef and squid therefore never delete a bucket key: it stays behind with `deletion_allowed` set. This is visible in `ceph-v18.2.8.jsonl` and `ceph-v19.2.7.jsonl` (three `config` calls, no `DELETE`).
+With a current OpenBao, squid therefore never deletes a bucket key: it stays behind with `deletion_allowed` set. This is visible in `ceph-v19.2.7.jsonl` (three `config` calls, no `DELETE`). Everything else works; only the key is left behind.
+
+This is a bug in RGW, [Ceph issue 65626](https://tracker.ceph.com/issues/65626): RGW looks at the length of the answer's body, not at the status. It was fixed for tentacle ([ceph/ceph#57046](https://github.com/ceph/ceph/pull/57046)); the backport to squid ([ceph/ceph#73115](https://github.com/ceph/ceph/pull/73115)) was merged after 19.2.7. Reef (18.2.x, end of life) has the same bug and no fix.
 
 The `*-empty-key-writes.jsonl` captures repeat the run with the recorder turning those two responses into `204` with no body. Then all three releases send `DELETE` after `config`. **transhim must answer key create and key config with `204` and an empty body.** This is a place where transhim works better with RGW than the reference does.
 
@@ -135,31 +138,35 @@ These are OpenBao's answers, recorded for the golden fixtures. Where transhim de
 
 ## Other observations
 
-- **Decrypt volume.** RGW calls `decrypt` for every read of an encrypted object, including HeadObject and every part of a multipart upload. A 1000-part upload is 1000 decrypt calls for the same wrapped key. This is the case the decrypt cache (DESIGN.md §9) exists for.
-- **CopyObject of an encrypted object** answers `501 NotImplemented` on reef and squid, before any Vault call. It works on tentacle. This is RGW's own limitation.
-- **Token file.** RGW reads the token from a file that group and others must not be able to access (reef, squid; tentacle allows up to `0740`). `docker/ceph-demo.sh` writes it as the `ceph` user for that reason.
-- **aws CLI.** aws-cli 2.36 crashes while printing an RGW error whose `<Message>` is empty (reef and squid send those). The capture script reads the status and error code from the wire instead.
+- **Decrypt volume.** RGW calls `decrypt` for every read of an encrypted object (but see umbrella's key cache below), including HeadObject and every part of a multipart upload. A 1000-part upload is 1000 decrypt calls for the same wrapped key. This is the case the decrypt cache (DESIGN.md §9) exists for.
+- **Umbrella has a key cache of its own, for SSE-KMS.** From the source (`rgw_kms_cache.cc`) and the options of 21.2.0: `rgw_crypt_s3_kms_cache_enabled` is on by default and keeps up to 128 unwrapped data keys (`rgw_crypt_s3_kms_cache_max_size`) for 60 seconds (`rgw_crypt_s3_kms_cache_positive_ttl`) in the Linux kernel keyring. It caches failures as well: a missing key for 120 seconds, other errors for 10. SSE-S3 is not cached. Where it is in effect, a repeated read of an SSE-KMS object within the TTL does not reach the Transit endpoint: no `decrypt` call, no audit event, and a key disabled in the KMS stays usable for that long on top of transhim's own caches.
+  - It was **not seen working** here. In a container with docker's default seccomp profile the keyring is not available and RGW turns the cache off at startup: that is the setup of the captures and of the acceptance test, where umbrella calls `decrypt` on every read like the releases before. With the keyring allowed (`seccomp=unconfined`), the first cache hit failed (`kms_error_secret_store`; the S3 request failed), after which RGW turned the cache off by itself. How it behaves on a real deployment is not verified.
+- **CopyObject of an encrypted object** answers `501 NotImplemented` on squid, before any Vault call. It works on tentacle and umbrella. This is RGW's own limitation.
+- **Token file.** RGW reads the token from a file that group and others must not be able to access (squid; tentacle and umbrella allow up to `0740`). `docker/ceph-demo.sh` writes it as the `ceph` user for that reason.
+- **aws CLI.** aws-cli 2.36 crashes while printing an RGW error whose `<Message>` is empty (squid sends those). The capture script reads the status and error code from the wire instead.
 
 ## How RGW reacts to a failing Transit endpoint
 
 Observed with the acceptance test (`integration/`, `TestRGWFaults` and `TestRGWEndpointDown`), which puts a fault in front of transhim for one kind of request at a time. The S3 operations are PutObject (fails in `datakey`) and GetObject (fails in `decrypt`) with SSE-KMS; both react the same way.
 
-| Transit endpoint answers | S3 client sees (tentacle, squid) | S3 client sees (reef) |
-|---|---|---|
-| `400` (missing key, invalid ciphertext) | `400 InvalidArgument` | `400 InvalidArgument` |
-| `403` | `403 AccessDenied` | `403 AccessDenied` |
-| `500` | `500 InternalError` | `500 UnknownError` |
-| `502` | `500 InternalError` | `500 UnknownError` |
-| `503` | `503 ServiceUnavailable` | `500 UnknownError` |
-| `200` without `data`, or not JSON | `400 InvalidArgument` | `400 InvalidArgument` |
-| connection reset, or nothing listening | `500 InternalError` | `500 UnknownError` |
-| answer after 3 s, or after 75 s | success | success |
+| Transit endpoint answers | S3 client sees |
+|---|---|
+| `400` (missing key, invalid ciphertext) | `400 InvalidArgument` |
+| `403` | `403 AccessDenied` |
+| `500` | `500 InternalError` |
+| `502` | `500 InternalError` |
+| `503` | `503 ServiceUnavailable` |
+| `200` without `data`, or not JSON | `400 InvalidArgument` |
+| connection reset, or nothing listening | `500 InternalError` |
+| answer after 3 s, or after 75 s | success |
+
+All three releases react the same way. The 75 second wait was measured on squid and tentacle only.
 
 What follows from it:
 
 - **RGW fails closed.** In none of these cases was an object stored unencrypted or handed out. A PutObject whose `datakey` failed leaves no object behind.
 - **RGW does not retry**, and it sets no timeout that 75 seconds would reach: a slow key service makes S3 requests slow, not failed. Each waiting S3 request holds its RGW request thread meanwhile.
-- **`503` is worth sending.** transhim answers `503` for an `UpstreamError` marked `Retryable`. On squid and tentacle that reaches the S3 client as `503 ServiceUnavailable`, which S3 SDKs retry.
+- **`503` is worth sending.** transhim answers `503` for an `UpstreamError` marked `Retryable`. That reaches the S3 client as `503 ServiceUnavailable`, which S3 SDKs retry.
 - **A `403` is visible as such.** An authorizer that denies a key by name shows up as `403 AccessDenied` at the S3 client.
 - **SSE-S3 key operations.** If `POST keys/{name}` fails, the PutObject that needed the key fails (`500`) and stores nothing. If `config` or `DELETE` fail, DeleteBucket succeeds all the same and the key is orphaned, as described above.
 - Unencrypted objects are not affected by any of this.
