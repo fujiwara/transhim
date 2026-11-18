@@ -164,7 +164,7 @@ The backend's `Encrypt` is called. A key the backend does not know is `400 encry
 
 Ceph RGW sends this for SSE-S3, on the first encrypted write to a bucket, and again later for a key that exists.
 
-- If the backend implements `KeyLifecycle` (the hierarchical backend does), `CreateKey` is called. A key that exists is left as it is, and the request succeeds.
+- If the backend implements `KeyLifecycle` (the hierarchical backend does), `CreateKey` is called. A key that exists is left as it is, and the request succeeds. A hierarchical backend with `ReadOnly` creates nothing: a key that does not exist is `400 encryption key not found`.
 - Otherwise nothing happens and the request succeeds: keys are expected to exist in the KMS. With `RejectUnmanagedKeyOps` on the mount, the answer is `405` instead.
 
 The answer is `204` without a body. The body fields (`type`, `derived`, and so on) are ignored, except `exportable: true`, which is refused: `400 exportable keys are not supported`.
@@ -179,7 +179,7 @@ The flag only matters on a mount with `RequireDeletionAllowed`, where a key can 
 
 Ceph RGW sends this for SSE-S3 when a bucket is deleted.
 
-- If the backend implements `KeyLifecycle`, `DeleteKey` is called. With the hierarchical backend this removes the key for good: everything encrypted with it becomes unreadable. A key that does not exist is not an error.
+- If the backend implements `KeyLifecycle`, `DeleteKey` is called. With the hierarchical backend this removes the key for good: everything encrypted with it becomes unreadable (with `ReadOnly` the key stays in the store, and only the server forgets it). A key that does not exist is not an error.
 - Otherwise nothing is deleted and the request succeeds (or is answered `405` with `RejectUnmanagedKeyOps`).
 - In every case the key's entries are removed from the decrypt cache, also if the backend failed.
 - On a mount with `RequireDeletionAllowed`: `400 deletion is not allowed for this key` unless the flag was set.

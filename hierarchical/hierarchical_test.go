@@ -979,3 +979,131 @@ func TestKeyRecreatedDuringLoad(t *testing.T) {
 		t.Errorf("Decrypt with the new key = %q, %v", got, err)
 	}
 }
+
+// readOnlyStore fails the test when it is written to.
+type readOnlyStore struct {
+	hierarchical.KeyStore
+	t *testing.T
+}
+
+func (s readOnlyStore) PutIfAbsent(context.Context, string, string, hierarchical.StoredKey) error {
+	s.t.Error("a read-only backend called PutIfAbsent")
+	return errors.New("read-only")
+}
+
+func (s readOnlyStore) Delete(context.Context, string, string) error {
+	s.t.Error("a read-only backend called Delete")
+	return errors.New("read-only")
+}
+
+// TestReadOnly: a read-only backend serves the keys another backend manages
+// on the same store, and never writes to it.
+func TestReadOnly(t *testing.T) {
+	ctx := t.Context()
+	f := newFixture(t) // the provisioning side
+	ro, err := hierarchical.New(f.root, rootKey, readOnlyStore{f.store, t}, hierarchical.ReadOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a key nobody created
+	if err := ro.CreateKey(ctx, mountID, bucket); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("CreateKey of a missing key: err = %v, want ErrKeyNotFound", err)
+	}
+	if _, err := ro.Encrypt(ctx, transhim.EncryptRequest{MountID: mountID, KeyName: bucket, Plaintext: []byte("p")}); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("Encrypt with a missing key: err = %v, want ErrKeyNotFound", err)
+	}
+	if e, d := f.rootCalls(); e != 0 || d != 0 {
+		t.Errorf("root calls for a missing key = %d encrypts, %d decrypts; want none", e, d)
+	}
+
+	// created elsewhere: usable, and RGW's create request succeeds
+	if err := f.b.CreateKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.CreateKey(ctx, mountID, bucket); err != nil {
+		t.Errorf("CreateKey of an existing key: %v", err)
+	}
+	wk := encrypt(t, ro, bucket, "data key", "aad")
+	if got, err := decrypt(t, f.b, bucket, wk, "aad"); err != nil || string(got) != "data key" {
+		t.Errorf("the managing backend decrypts = %q, %v", got, err)
+	}
+
+	// DeleteKey leaves the store alone and only forgets the key
+	_, before := f.rootCalls()
+	if err := ro.DeleteKey(ctx, mountID, bucket); err != nil {
+		t.Errorf("DeleteKey: %v", err)
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Errorf("%d keys in the store after DeleteKey, want 1", n)
+	}
+	if got, err := decrypt(t, ro, bucket, wk, "aad"); err != nil || string(got) != "data key" {
+		t.Errorf("decrypt after DeleteKey = %q, %v; the key is still in the store", got, err)
+	}
+	if _, after := f.rootCalls(); after != before+1 {
+		t.Errorf("root decrypts after DeleteKey = %d, want %d: the key must be loaded again", after, before+1)
+	}
+
+	// deleted elsewhere, and forgotten here when RGW's delete request arrives
+	if err := f.b.DeleteKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.DeleteKey(ctx, mountID, bucket); err != nil {
+		t.Errorf("DeleteKey: %v", err)
+	}
+	if _, err := decrypt(t, ro, bucket, wk, "aad"); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("decrypt after the key was deleted from the store: err = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestReadOnlyBehindServer: what RGW gets for its key requests.
+func TestReadOnlyBehindServer(t *testing.T) {
+	f := newFixture(t)
+	ro, err := hierarchical.New(f.root, rootKey, readOnlyStore{f.store, t}, hierarchical.ReadOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := transhim.NewServer(
+		transhim.Mount("/v1/transit-sse-s3", mountID, ro),
+		transhim.AllowUnauthenticated(),
+		transhim.WithLogger(slog.New(slog.DiscardHandler)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	call := func(method, path string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+"/v1/transit-sse-s3/"+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		return res.StatusCode, string(raw)
+	}
+
+	if status, body := call("POST", "keys/"+bucket); status != 400 || !strings.Contains(body, "encryption key not found") {
+		t.Errorf("create of a key that was not provisioned: %d %s", status, body)
+	}
+	if err := f.b.CreateKey(t.Context(), mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := call("POST", "keys/"+bucket); status != 204 {
+		t.Errorf("create of a provisioned key: %d %s", status, body)
+	}
+	if status, body := call("POST", "datakey/plaintext/"+bucket); status != 200 {
+		t.Errorf("datakey: %d %s", status, body)
+	}
+	if status, body := call("DELETE", "keys/"+bucket); status != 204 {
+		t.Errorf("delete: %d %s", status, body)
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Errorf("%d keys in the store after RGW's delete request, want 1", n)
+	}
+}

@@ -428,6 +428,7 @@ Behavior:
 - Concurrent loads of the same intermediate key (first use, or after its cache entry expired) are merged into one KeyStore read and one root call, for the same reason and with the same cancellation rule as in §9.
 - Root backend errors are passed on only if they are `ErrUpstream`, `ErrPermissionDenied`, or a context error. Anything else (the root key is missing, a stored key does not unwrap) becomes an internal error: it is not the client's key or ciphertext that is wrong.
 - `DeleteKey`: delete from the KeyStore and evict from the cache. This is the crypto-shredding point.
+- `ReadOnly` (option): the backend never writes to the KeyStore, so the server can run with read access to it only. `CreateKey` succeeds for a key that exists and returns `ErrKeyNotFound` otherwise; `DeleteKey` only evicts from the cache and succeeds. Keys are created and deleted by a backend without the option on the same store (a provisioning tool). RGW ignores the outcome of its delete request anyway, so answering it with success loses nothing.
 - Eviction is local to the process. When several transhim instances share a KeyStore, the other instances keep the unwrapped intermediate key until its TTL expires, so crypto-shredding completes only after at most that TTL (plus the decrypt cache TTL, §9). Documentation must state this.
 - There is no lazy creation in v1: `Encrypt` on a missing key returns `ErrKeyNotFound`. RGW always calls `keys/` before the first `datakey` (verified), so an `AutoCreate` option is not needed and is left out.
 

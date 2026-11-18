@@ -80,6 +80,7 @@ When a bucket with an SSE-S3 key is deleted, RGW has the key deleted. With the h
 
 This is best effort. A key stays behind in the `KeyStore` when:
 
+- The backend is read-only (`hierarchical.ReadOnly`): then keys are created and deleted outside the server, see [server.md](server.md#a-server-that-only-reads-the-keystore).
 - `DeleteBucketEncryption` was called on the bucket and the bucket was deleted before another SSE-S3 write. RGW then no longer knows the bucket had a key.
 - The delete request failed. RGW removes the bucket all the same.
 

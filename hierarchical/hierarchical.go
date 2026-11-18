@@ -29,6 +29,9 @@
 //     rotation that would lift the limit.
 //   - A key is not always deleted when its bucket is: see docs/compat.md.
 //     Orphaned intermediate keys can stay behind in the KeyStore.
+//   - With ReadOnly, the Backend never writes to the KeyStore, and may be
+//     given read access only. Keys are then created and deleted by another
+//     Backend on the same KeyStore, for example in a provisioning tool.
 package hierarchical
 
 import (
@@ -81,6 +84,25 @@ func WithKeyCacheTTL(ttl time.Duration) Option {
 	}
 }
 
+// ReadOnly makes the Backend never write to the KeyStore, so that the server
+// can run with read access to it only. Keys are created and deleted elsewhere:
+// by a Backend without this option, with the same root key name, on the same
+// KeyStore, calling CreateKey and DeleteKey under the same mount ID.
+//
+// What changes:
+//
+//   - CreateKey creates nothing. It succeeds if the key exists and returns an
+//     error wrapping transhim.ErrKeyNotFound otherwise.
+//   - DeleteKey deletes nothing from the KeyStore. It only drops the key from
+//     this Backend's memory and succeeds. The data stays readable until the
+//     key is deleted from the KeyStore by whoever manages it.
+func ReadOnly() Option {
+	return func(b *Backend) error {
+		b.readOnly = true
+		return nil
+	}
+}
+
 type keyID struct{ mountID, name string }
 
 type cachedKey struct {
@@ -95,6 +117,7 @@ type Backend struct {
 	rootKeyName string
 	store       KeyStore
 	ttl         time.Duration
+	readOnly    bool
 	now         func() time.Time
 
 	mu    sync.Mutex
@@ -360,6 +383,9 @@ func (b *Backend) Decrypt(ctx context.Context, req transhim.DecryptRequest) ([]b
 // CreateKey implements transhim.KeyLifecycle. If the key exists, it is kept.
 // Of several concurrent calls for the same key, one wins and the others adopt
 // its key.
+//
+// With ReadOnly it creates nothing, and a key that does not exist is an error
+// wrapping transhim.ErrKeyNotFound.
 func (b *Backend) CreateKey(ctx context.Context, mountID, keyName string) error {
 	// Usually the key is either new or was created long ago (RGW asks again
 	// after DeleteBucketEncryption). Looking first saves a root call then.
@@ -369,6 +395,9 @@ func (b *Backend) CreateKey(ctx context.Context, mountID, keyName string) error 
 	}
 	if !errors.Is(err, transhim.ErrKeyNotFound) {
 		return fmt.Errorf("hierarchical: get key from store: %w", err)
+	}
+	if b.readOnly {
+		return fmt.Errorf("hierarchical: the key is not in the store, and a read-only backend does not create it: %w", transhim.ErrKeyNotFound)
 	}
 
 	id := keyID{mountID, keyName}
@@ -404,8 +433,13 @@ func (b *Backend) CreateKey(ctx context.Context, mountID, keyName string) error 
 // DeleteKey implements transhim.KeyLifecycle. This is the crypto-shredding
 // point: without the intermediate key, nothing encrypted with it can be read.
 // See the package documentation for how long other instances keep the key.
+//
+// With ReadOnly it leaves the KeyStore alone and only forgets the key.
 func (b *Backend) DeleteKey(ctx context.Context, mountID, keyName string) error {
-	err := b.store.Delete(ctx, mountID, keyName)
+	var err error
+	if !b.readOnly {
+		err = b.store.Delete(ctx, mountID, keyName)
+	}
 	// Forget the key even if the store failed: it may be gone all the same.
 	id := keyID{mountID, keyName}
 	b.mu.Lock()
