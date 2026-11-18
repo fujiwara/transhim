@@ -57,10 +57,10 @@ Deferred to later versions (may be added later; do not implement now):
 - D3. `datakey/wrapped` (ciphertext-only datakey).
 - D4. Key rotation endpoints (`keys/{name}/rotate`).
 - D5. Built-in Prometheus metrics. v1 exposes hooks only.
-- D6. Token stubs `auth/token/lookup-self` and `renew-self` (§6.7). They were meant for go-kms-wrapping–based clients; OpenBao's transit seal turned out to work without them (compat.md).
-- D7. `GET keys/{name}` (§6.5) and the `KeyDescriber` interface. RGW is not expected to read key metadata.
+- D6. Token stubs `auth/token/lookup-self` and `renew-self` (§6.7). They were meant for go-kms-wrapping–based clients; OpenBao's transit seal turned out to work without them (compat.md). The Kubernetes KMS plugin vault-kubernetes-kms does need `lookup-self` (UC6).
+- D7. `GET keys/{name}` (§6.5) and the `KeyDescriber` interface. RGW is not expected to read key metadata. RustFS and vault-kubernetes-kms do (UC5, UC6).
 - D8. `GET /v1/sys/health` (§6.7). Users write their own `main` and can add a health handler to their mux.
-- D9. Verification and support claims for any client other than RGW (UC3–UC5).
+- D9. Verification and support claims for any client other than RGW (UC3–UC6).
 
 ---
 
@@ -94,7 +94,7 @@ Verified behavior that shapes the design (compat.md):
 
 Creating one cloud KMS key per bucket is usually too expensive and too slow. transhim therefore ships an optional **hierarchical backend** (§8). It keeps one root key in the cloud KMS and one wrapped intermediate key per bucket in a user-provided store. Deleting the bucket key deletes the intermediate key, which achieves crypto-shredding. This is best effort: as described above, RGW does not always send the delete, so orphaned intermediate keys are possible.
 
-UC3–UC5 below are **not v1 targets**. They are listed to explain why `encrypt` exists and what the deferred items (D6–D9) are for. v1 neither verifies nor claims support for them.
+UC3–UC6 below are **not v1 targets**. They are listed to explain why `encrypt` exists and what the deferred items (D6–D9) are for. v1 neither verifies nor claims support for them.
 
 ### UC3. OpenTofu state encryption (future)
 
@@ -113,6 +113,10 @@ Most of these use the go-kms-wrapping transit wrapper. That wrapper calls token 
 ### UC5. RustFS (verified: not supported)
 
 RustFS has a `vault-transit` KMS backend. Its request set was captured for RustFS 1.0.6 ([compat.md](compat.md)): it needs `LIST keys`, `GET keys/{name}` (D7), `associated_data` on `encrypt` and `decrypt`, and, outside Transit, a KV v2 engine at the same address for its key records. It does not work against transhim, and cannot with transhim alone.
+
+### UC6. Kubernetes KMS plugin (verified: not supported)
+
+vault-kubernetes-kms lets kube-apiserver encrypt Secrets with a Transit key. Its request set was captured for version 1.4.0 ([compat.md](compat.md)): besides `encrypt` and `decrypt` it needs `auth/token/lookup-self` (D6) at startup and `GET keys/{name}` (D7) for `latest_version`, which it reports to Kubernetes as the key ID. It does not work against transhim; with those two reads answered, it does.
 
 ---
 
@@ -255,7 +259,7 @@ In v1 the server serves nothing outside its mounts. The specification below is k
 
 Token stubs (outside mounts, under `/v1/auth/token/`) exist for go-kms-wrapping–based clients:
 
-- `GET /v1/auth/token/lookup-self`: runs the authorizer with op `token_lookup`. On success, returns `data` with `renewable: false`, `ttl: 0`, `expire_time: null`, `policies: ["default"]`, and `type: "service"`.
+- `GET /v1/auth/token/lookup-self`: runs the authorizer with op `token_lookup`. On success, returns `data` with `renewable: false`, `ttl: 0`, `creation_ttl: 0` (vault-kubernetes-kms reads it, compat.md), `expire_time: null`, `policies: ["default"]`, and `type: "service"`.
 - `POST /v1/auth/token/renew-self`: returns an `auth` block with `renewable: false` and `lease_duration: 0`.
 
 These stubs are disabled by default and enabled with `WithTokenStubs()`. **The implementer must verify** against the go-kms-wrapping source that `renewable: false` stops its renewal loop cleanly.
