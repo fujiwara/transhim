@@ -2,7 +2,7 @@
 
 > A Go framework for building HashiCorp Vault Transit–compatible API servers whose actual cryptography is delegated to user-supplied backends (typically a cloud KMS).
 
-Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); all milestones implemented: v1 is accepted against Ceph 18.2.8, 19.2.7, and 20.2.5)
+Status: Draft v0.3 (M0 capture results applied, see [compat.md](compat.md); all milestones implemented: v1 is accepted against Ceph 19.2.7, 20.2.5, and 21.2.0)
 Audience: implementers (including coding agents) and reviewers
 
 ---
@@ -469,7 +469,7 @@ Shipped KeyStores: `memstore` (tests and dev only). Production stores (Postgres,
 
 The design relies on assumptions taken from documentation and memory. The implementer must confirm each one and record the result in `docs/compat.md`. Items 3 and 5 concern non-RGW clients and are **deferred (D9)**; v1 requires items 1, 2, 4 (for RGW only), and 6.
 
-Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 18.2.8, 19.2.7, and 20.2.5 against OpenBao 2.7.2. The results are in [compat.md](compat.md), the raw captures in `testdata/capture/`, and they are reproducible with `compat/capture.sh`. How RGW reacts to 403, 5xx, and a slow or unreachable Transit endpoint was added in M4.
+Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 19.2.7, 20.2.5, and 21.2.0 against OpenBao 2.7.2 (18.2.8 was covered until reef reached its end of life). The results are in [compat.md](compat.md), the raw captures in `testdata/capture/`, and they are reproducible with `compat/capture.sh`. How RGW reacts to 403, 5xx, and a slow or unreachable Transit endpoint was added in M4.
 
 1. Capture the actual HTTP requests made by Ceph RGW (Reef and Squid, and the latest available release) for SSE-KMS and SSE-S3 with `secret_engine = transit`. Do this with a recording proxy in front of a real Vault or OpenBao. Confirm the exact paths, methods, body fields (`context`?), the expected status codes, and whether `keys/` is called before the first `datakey`.
 2. Confirm which `rgw_crypt_vault_secret_engine` compat value disables the legacy export path.
