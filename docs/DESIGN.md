@@ -207,7 +207,7 @@ Behavior: if the backend implements `DataKeyGenerator`, use it. Otherwise genera
 
 RGW may not call this endpoint. It is in v1 because other Transit clients cannot work without it (G3). It is covered by the conformance suite, not by the RGW integration test.
 
-Request: `plaintext` (base64, required), `context` (base64, optional), `key_version` (ignored with a warning in v1).
+Request: `plaintext` (base64, required), `context` (base64, optional), `key_version` (ignored with a warning in v1). A non-empty `associated_data`, here and in `decrypt`, is refused with 400: a client that sends it (RustFS does) relies on it being bound into the ciphertext, so ignoring it like other unknown fields would drop that binding silently.
 Response `data`: `ciphertext`, `key_version`.
 
 Plaintext size limit: configurable per mount, default 4096 bytes after decoding. Return 400 if it is exceeded. This exists because many cloud KMS Encrypt APIs cap at 4 KiB.
