@@ -298,6 +298,29 @@ sseS3, err := hierarchical.New(
 - Deleting a key deletes its intermediate key, which makes the bucket's data unreadable for good (crypto-shredding). RGW does not always delete the key of a deleted bucket, so orphaned keys can stay in the store; see [rgw.md](rgw.md).
 - Unwrapped intermediate keys are cached in memory (`hierarchical.WithKeyCacheTTL`, default 5 minutes). Loading one costs a `KeyStore` read and a KMS call; requests for the same key that arrive meanwhile wait for that load.
 
+### A server that only reads the `KeyStore`
+
+By default the server writes to the `KeyStore`: it creates a bucket's key when RGW asks for it, on the first encrypted write, and deletes it with the bucket. If the server should get by with read access to the store, create and delete the keys elsewhere, for example in the tool that creates your buckets, and give the server a read-only backend:
+
+```go
+// in the server: never writes to the store
+sseS3, err := hierarchical.New(kmsBackend, "transhim-root", readOnlyStore, hierarchical.ReadOnly())
+```
+
+```go
+// in the provisioning tool: a backend on the same store, with write access
+keys, err := hierarchical.New(kmsBackend, "transhim-root", store)
+// ...
+err = keys.CreateKey(ctx, "rgw-sse-s3", keyName) // when the bucket is created
+err = keys.DeleteKey(ctx, "rgw-sse-s3", keyName) // when the bucket is deleted
+```
+
+- **Root key name, mount ID, and key name must be the server's.** All three are bound into the stored key. `CreateKey` keeps a key that exists, so it is safe to repeat.
+- **The key name** is what RGW's `rgw_crypt_sse_s3_key_template` makes of the bucket: by default the bucket's marker, which RGW assigns when the bucket is created (`radosgw-admin bucket stats --bucket=NAME` shows it). A bucket created again under the same name gets a new marker.
+- **Create the key before the first SSE-S3 write.** Until it exists, the server answers RGW's create request with `400 encryption key not found`, the S3 client gets `400 InvalidArgument`, and nothing is stored. The audit event of that request (`key_create`) carries the key name RGW asked for.
+- **Deleting a bucket deletes nothing.** The server answers RGW's delete request with success and only drops the key from its memory. The data stays readable until the provisioning side calls `DeleteKey`; the server's caches hold the key up to their TTLs after that.
+- The provisioning tool needs the KMS permission to encrypt with the root key; the server then only needs to decrypt with it.
+
 ### Rotating the root key
 
 Rotation inside the KMS that keeps the key's identity (automatic rotation in AWS KMS, key rotation in SAKURA Cloud KMS) needs nothing from transhim: old wrapped keys keep decrypting.

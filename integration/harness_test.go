@@ -103,7 +103,8 @@ type harness struct {
 }
 
 // newHarness starts a transhim server where RGW expects its Transit endpoint.
-func newHarness(t *testing.T, decryptCache bool) *harness {
+// sseOpts configure the hierarchical backend of the SSE-S3 mount.
+func newHarness(t *testing.T, decryptCache bool, sseOpts ...hierarchical.Option) *harness {
 	t.Helper()
 	endpoint := os.Getenv("TRANSHIM_TEST_RGW_ENDPOINT")
 	if endpoint == "" {
@@ -117,7 +118,7 @@ func newHarness(t *testing.T, decryptCache bool) *harness {
 	h.kms.AddKey(kmsMount, kmsKey1)
 	h.kms.AddKey(kmsMount, kmsKey2)
 	h.root.AddKey(sseMount, rootKey)
-	sse, err := hierarchical.New(h.root, rootKey, h.store)
+	sse, err := hierarchical.New(h.root, rootKey, h.store, sseOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}
