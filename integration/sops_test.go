@@ -3,15 +3,11 @@ package integration_test
 import (
 	"bytes"
 	"context"
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/fujiwara/transhim"
@@ -26,14 +22,9 @@ const (
 
 // sopsHarness is a transhim server for sops, plus the means to observe it.
 type sopsHarness struct {
-	t       *testing.T
-	backend *transhimtest.FakeBackend
-	url     string // the server's address
-	dir     string
-
-	mu      sync.Mutex
-	events  []event
-	methods []string
+	*clientServer
+	t   *testing.T
+	dir string
 }
 
 // newSopsHarness starts a server with one mount at /v1/transit, as sops users
@@ -43,41 +34,7 @@ func newSopsHarness(t *testing.T) *sopsHarness {
 	if _, err := exec.LookPath("sops"); err != nil {
 		t.Skip("sops is not installed")
 	}
-	h := &sopsHarness{t: t, backend: transhimtest.NewFakeBackend(), dir: t.TempDir()}
-	h.backend.AddKey(sopsMount, sopsKey)
-	srv, err := transhim.NewServer(
-		// a KMS with provisioned keys: no KeyLifecycle
-		transhim.Mount("/v1/transit", sopsMount, plainBackend{h.backend}),
-		transhim.WithAuthorizer(transhim.StaticTokenAuthorizer(sopsToken)),
-		transhim.WithLogger(slog.New(slog.DiscardHandler)),
-		transhim.WithAuditHook(func(_ context.Context, ev transhim.AuditEvent) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			h.events = append(h.events, event{ev.Op, ev.MountID, ev.KeyName, ev.Status, string(ev.Context)})
-		}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.mu.Lock()
-		h.methods = append(h.methods, r.Method+" "+r.URL.Path)
-		h.mu.Unlock()
-		srv.ServeHTTP(w, r)
-	}))
-	t.Cleanup(ts.Close)
-	h.url = ts.URL
-	return h
-}
-
-// take returns what the server saw since the last call: the audit events as
-// "op status" strings, and the requests as "METHOD path".
-func (h *sopsHarness) take() (evs, requests []string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	evs, requests = ops(h.events, sopsMount), h.methods
-	h.events, h.methods = nil, nil
-	return evs, requests
+	return &sopsHarness{clientServer: newClientServer(t, sopsMount, sopsKey, sopsToken), t: t, dir: t.TempDir()}
 }
 
 // keyURI is how sops names a Transit key.

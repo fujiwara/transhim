@@ -57,7 +57,7 @@ Deferred to later versions (may be added later; do not implement now):
 - D3. `datakey/wrapped` (ciphertext-only datakey).
 - D4. Key rotation endpoints (`keys/{name}/rotate`).
 - D5. Built-in Prometheus metrics. v1 exposes hooks only.
-- D6. Token stubs `auth/token/lookup-self` and `renew-self` (§6.7). Only go-kms-wrapping–based clients need them.
+- D6. Token stubs `auth/token/lookup-self` and `renew-self` (§6.7). They were meant for go-kms-wrapping–based clients; OpenBao's transit seal turned out to work without them (compat.md).
 - D7. `GET keys/{name}` (§6.5) and the `KeyDescriber` interface. RGW is not expected to read key metadata.
 - D8. `GET /v1/sys/health` (§6.7). Users write their own `main` and can add a health handler to their mux.
 - D9. Verification and support claims for any client other than RGW (UC3–UC5).
@@ -108,7 +108,7 @@ The `openbao` key provider uses `datakey/plaintext` and `decrypt`, and may read 
 - SOPS (`hc_vault_transit`)
 - Pulumi `hashivault://` secrets provider
 
-Most of these use the go-kms-wrapping transit wrapper. That wrapper may call token `lookup-self` / `renew-self` (see §6.7).
+Most of these use the go-kms-wrapping transit wrapper. That wrapper calls token `renew-self` once at startup and goes on if it fails (see §6.7 and compat.md). Verified so far: OpenBao's transit seal and SOPS, both working ([compat.md](compat.md)).
 
 ### UC5. RustFS (verified: not supported)
 
@@ -474,7 +474,7 @@ Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 19.2.7, 20.2.5, and 21.2
 
 1. Capture the actual HTTP requests made by Ceph RGW (Reef and Squid, and the latest available release) for SSE-KMS and SSE-S3 with `secret_engine = transit`. Do this with a recording proxy in front of a real Vault or OpenBao. Confirm the exact paths, methods, body fields (`context`?), the expected status codes, and whether `keys/` is called before the first `datakey`.
 2. Confirm which `rgw_crypt_vault_secret_engine` compat value disables the legacy export path.
-3. Confirm the behavior of the go-kms-wrapping transit wrapper with `renewable: false` from `lookup-self`.
+3. Confirm the behavior of the go-kms-wrapping transit wrapper with `renewable: false` from `lookup-self`. **Done** with OpenBao 2.7.2's transit seal (compat.md): it does not call `lookup-self`, and a failing `renew-self` does not stop it.
 4. Confirm whether any client parses the `vault:vN:` version, or validates the ciphertext format beyond treating it as opaque.
 5. Capture the RustFS `vault-transit` request set before claiming UC5. **Done** for RustFS 1.0.6 (compat.md): not supported.
 6. Confirm Vault's exact error status and message for "key not found" on decrypt and datakey.

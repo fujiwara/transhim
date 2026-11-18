@@ -191,6 +191,27 @@ $ sops decrypt secrets.enc.yaml
 - **Errors reach the user.** sops prints the status and transhim's message (`Code: 403. Errors: * permission denied`).
 - **`5xx` is retried.** Vault's Go client sends a request up to three times, about three seconds in all, when the answer is `502` or `503`. A failing key service therefore gets three calls per sops invocation.
 
+### OpenBao transit seal (go-kms-wrapping)
+
+OpenBao with `seal "transit"` works against transhim: it initializes, and unseals itself after a restart. The seal is the transit wrapper of go-kms-wrapping, which Vault's auto-unseal and other HashiCorp-style products use as well; only OpenBao was run. Observed with OpenBao 2.7.2 (`integration/`, `TestOpenBaoTransitSeal` and `TestOpenBaoTransitSealFailure`); what it sends to another OpenBao 2.7.2 was recorded with `tools/vaultrec` and is the same (§12 item 3).
+
+```hcl
+seal "transit" {
+  address    = "https://transhim.example.com:8200"
+  token      = "..."          # what the server's authorizer expects
+  key_name   = "autounseal"
+  mount_path = "transit/"     # the mount's prefix without /v1/
+}
+```
+
+- **What it calls.** `PUT {prefix}/encrypt/{name}` and `PUT {prefix}/decrypt/{name}`, without a context. It encrypts a one byte plaintext as a health check, at startup and around every unseal; at `operator init` it wraps the root key; at every start of an initialized server it decrypts it. No `datakey`, no `keys/` call.
+- **Token renewal is not needed.** At every start it sends `PUT /v1/auth/token/renew-self` once. transhim answers `404`, as it does for everything outside its mounts, and OpenBao goes on without a word in its log. (Against OpenBao the answer is `400 lease is not renewable` for a root token, which it takes the same way.) The token stubs planned in DESIGN.md §6.7 are not needed for this client.
+- **The key must exist** in the backend; nothing creates it.
+- **If the key cannot be used, the server stays sealed.** With `decrypt` failing (`503`), a restarted OpenBao tries three times, stays sealed, and unseals at the next restart once the key service is back.
+- It uses Vault's Go client, like sops: `PUT`, `X-Vault-Request: true`, three attempts on `502` and `503`.
+
+The seal key protects the whole server's root key. The mount ID and the key name are bound into the wrapped key, so neither may change while a server is sealed with it.
+
 ### RustFS
 
 [RustFS](https://github.com/rustfs/rustfs) with its `vault-transit` KMS backend **does not work against transhim**, and cannot with transhim alone: it needs a KV v2 secrets engine at the same address. Observed with RustFS 1.0.6 (§12 item 5).
@@ -220,4 +241,4 @@ To serve RustFS, transhim would need `LIST keys`, `GET keys/{name}` in Vault's s
 
 ## Not covered yet
 
-- §12 item 3 (go-kms-wrapping): deferred with its clients (DESIGN.md §3, D9).
+- Other products built on go-kms-wrapping (Vault, Nomad, Boundary): expected to behave like OpenBao's seal, not run.
