@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.3.1](https://github.com/fujiwara/transhim/compare/v0.3.0...v0.3.1) - 2026-11-19
+
+- Require transhim v0.3.0 in the examples by @fujiwara in https://github.com/fujiwara/transhim/pull/25
+
 ## [v0.3.0](https://github.com/fujiwara/transhim/compare/v0.2.0...v0.3.0) - 2026-11-19
 
 - Require transhim v0.2.0 in the examples by @fujiwara in https://github.com/fujiwara/transhim/pull/15
