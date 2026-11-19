@@ -1,6 +1,9 @@
 package transhim
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Backend performs the actual key wrapping, typically by calling a cloud KMS.
 //
@@ -91,6 +94,30 @@ type KeyLifecycle interface {
 	// DeleteKey deletes the key, making its ciphertexts undecryptable. It
 	// must be idempotent: a missing key is not an error.
 	DeleteKey(ctx context.Context, mountID, keyName string) error
+}
+
+// KeyDescriber is an optional capability of a Backend that can tell whether a
+// key exists. The server uses it to answer a client that reads a key
+// (GET keys/{name}), as some do before they use it.
+//
+// Without it, every key is reported as existing, in version 1: a client then
+// learns that a key is missing when it uses it.
+type KeyDescriber interface {
+	// DescribeKey returns what is known about the key. If there is no such
+	// key, it returns an error wrapping ErrKeyNotFound.
+	DescribeKey(ctx context.Context, mountID, keyName string) (KeyInfo, error)
+}
+
+// KeyInfo is what a KeyDescriber reports about a key.
+type KeyInfo struct {
+	// Version is the latest version of the key, shown to clients as
+	// latest_version. Values below 1 are reported as 1. Clients take a change
+	// as a rotation of the key (a Kubernetes KMS plugin reports it as the key
+	// ID), so it should only change when new ciphertexts are made with another
+	// key.
+	Version int
+	// CreatedAt is when that version was created, if known.
+	CreatedAt time.Time
 }
 
 // DataKeyRequest is the input of DataKeyGenerator.GenerateDataKey.

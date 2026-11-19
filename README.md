@@ -20,7 +20,7 @@ Documents:
 - [docs/server.md](docs/server.md): writing a server for production: the backend, authorization, per-bucket keys, caches, and operation
 - [docs/api.md](docs/api.md): the HTTP API: which Transit endpoints are served, how each is processed, and the differences from Vault
 - [docs/rgw.md](docs/rgw.md): configuring Ceph RGW, and what to know before going live
-- [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, how it reacts to failures, and where transhim differs from Vault; also what was seen with sops, OpenBao's transit seal, and RustFS
+- [docs/compat.md](docs/compat.md): what Ceph RGW really sends to a Transit endpoint, how it reacts to failures, and where transhim differs from Vault; also what was seen with sops, OpenBao's transit seal, a Kubernetes KMS plugin, and RustFS
 - [examples/awskms](examples/awskms): an AWS KMS backend and an example server
 - [examples/sakurakms](examples/sakurakms): the same for SAKURA Cloud KMS, a KMS without a parameter for authenticated data
 - [examples/sqlkeystore](examples/sqlkeystore): a durable `KeyStore` for the per-bucket keys, on PostgreSQL or SQLite

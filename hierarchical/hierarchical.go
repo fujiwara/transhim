@@ -380,6 +380,18 @@ func (b *Backend) Decrypt(ctx context.Context, req transhim.DecryptRequest) ([]b
 	return plaintext, nil
 }
 
+// DescribeKey implements transhim.KeyDescriber. It reads the KeyStore and does
+// not call the root backend. A key that is not in the store is an error
+// wrapping transhim.ErrKeyNotFound. Intermediate keys are not rotated, so the
+// version is always 1.
+func (b *Backend) DescribeKey(ctx context.Context, mountID, keyName string) (transhim.KeyInfo, error) {
+	stored, err := b.store.Get(ctx, mountID, keyName)
+	if err != nil {
+		return transhim.KeyInfo{}, fmt.Errorf("hierarchical: get key from store: %w", err)
+	}
+	return transhim.KeyInfo{Version: 1, CreatedAt: stored.CreatedAt}, nil
+}
+
 // CreateKey implements transhim.KeyLifecycle. If the key exists, it is kept.
 // Of several concurrent calls for the same key, one wins and the others adopt
 // its key.

@@ -191,7 +191,11 @@ func RunConformance(t *testing.T, c Conformance) {
 		s.wantStatus(t, s.do(t, http.MethodGet, "datakey/plaintext/"+key1, ``, s.c.Token), 405)
 		s.wantStatus(t, s.post(t, "rewrap/"+key1, ``), 404)
 		s.wantStatus(t, s.post(t, "export/encryption-key/"+key1, ``), 404)
-		s.wantStatus(t, s.do(t, http.MethodGet, "keys/"+key1, ``, s.c.Token), 404)
+		if r := s.do(t, http.MethodGet, "keys/"+key1, ``, s.c.Token); s.wantOK(t, r) {
+			if v, ok := r.Data["latest_version"].(float64); !ok || v < 1 {
+				t.Errorf("GET keys/%s: latest_version = %v", key1, r.Data["latest_version"])
+			}
+		}
 		s.wantStatus(t, s.post(t, "datakey/plaintext/a%2Fb", ``), 400)
 		s.wantStatus(t, s.post(t, "datakey/plaintext/", ``), 400)
 	})

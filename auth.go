@@ -21,15 +21,21 @@ const (
 	OpKeyConfig Op = "key_config"
 	// OpKeyDelete is DELETE keys/{name}.
 	OpKeyDelete Op = "key_delete"
+	// OpKeyRead is GET keys/{name}.
+	OpKeyRead Op = "key_read"
+	// OpTokenLookup is GET /v1/auth/token/lookup-self, which is served only
+	// with WithTokenLookup. It belongs to no mount and names no key.
+	OpTokenLookup Op = "token_lookup"
 )
 
 // AuthRequest describes a request to an Authorizer.
 type AuthRequest struct {
 	// Op is the operation.
 	Op Op
-	// MountID identifies the mount. It is never the mount's prefix.
+	// MountID identifies the mount. It is never the mount's prefix. It is ""
+	// for OpTokenLookup.
 	MountID string
-	// KeyName is the key the operation uses.
+	// KeyName is the key the operation uses. It is "" for OpTokenLookup.
 	KeyName string
 	// Context is the decoded "context" of a datakey, encrypt, or decrypt
 	// request: the bytes that are bound into the ciphertext along with the

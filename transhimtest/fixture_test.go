@@ -52,14 +52,19 @@ type difference struct {
 	msg    string // "": as recorded
 }
 
+// otherFields lists the probes that transhim answers as OpenBao does, but
+// with other fields in the data.
+var otherFields = map[string]bool{
+	// transhim has no derived keys: a key read never has the fields that
+	// describe the derivation
+	"read derived key": true,
+}
+
 // differences is keyed by the probe's label in compat/capture.sh. The reasons
 // are in docs/compat.md ("Reference behavior worth knowing").
 var differences = map[string]difference{
-	// no exportable keys, no reading of key metadata (D7)
+	// no exportable keys
 	"create key, exportable": {400, "exportable keys are not supported"},
-	"read key":               {404, "unsupported path"},
-	"read derived key":       {404, "unsupported path"},
-	"read missing key":       {0, "unsupported path"},
 	// transhim has no derived keys: a context is optional, but bound whenever
 	// it is given, where OpenBao ignores it for non-derived keys
 	"datakey, derived key without context":          {200, ""},
@@ -285,7 +290,7 @@ func (r *replayer) replay(label string, rec record) {
 			t.Errorf("%s: %s is a %s, OpenBao sends a %s", where, field, jsonType(got.top[field]), jsonType(raw))
 		}
 	}
-	if !slices.Equal(keys(got.data), keys(want.data)) {
+	if !otherFields[label] && !slices.Equal(keys(got.data), keys(want.data)) {
 		t.Errorf("%s: data fields %v, OpenBao sends %v", where, keys(got.data), keys(want.data))
 	}
 	for field, raw := range want.data {

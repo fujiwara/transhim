@@ -25,12 +25,12 @@ type clientServer struct {
 	requests []string
 }
 
-func newClientServer(t *testing.T, mountID, key, token string) *clientServer {
+func newClientServer(t *testing.T, mountID, key, token string, opts ...transhim.Option) *clientServer {
 	t.Helper()
 	c := &clientServer{backend: transhimtest.NewFakeBackend(), mountID: mountID}
 	c.backend.AddKey(mountID, key)
-	srv, err := transhim.NewServer(
-		// a KMS with provisioned keys: no KeyLifecycle
+	srv, err := transhim.NewServer(append(opts,
+		// a KMS with provisioned keys: no KeyLifecycle, no KeyDescriber
 		transhim.Mount("/v1/transit", mountID, plainBackend{c.backend}),
 		transhim.WithAuthorizer(transhim.StaticTokenAuthorizer(token)),
 		transhim.WithLogger(slog.New(slog.DiscardHandler)),
@@ -39,7 +39,7 @@ func newClientServer(t *testing.T, mountID, key, token string) *clientServer {
 			defer c.mu.Unlock()
 			c.events = append(c.events, event{ev.Op, ev.MountID, ev.KeyName, ev.Status, string(ev.Context)})
 		}),
-	)
+	)...)
 	if err != nil {
 		t.Fatal(err)
 	}

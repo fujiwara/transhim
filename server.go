@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type config struct {
 	bodyReadTimeout      time.Duration
 	cache                *DecryptCacheConfig
 	auditHook            AuditHook
+	tokenLookup          bool
 }
 
 // Option configures a Server.
@@ -135,8 +137,26 @@ func WithAuditHook(fn AuditHook) Option {
 	}
 }
 
+// tokenLookupPath is where Vault serves a token's own metadata.
+const tokenLookupPath = "/v1/auth/token/lookup-self"
+
+// WithTokenLookup makes the server answer GET /v1/auth/token/lookup-self, the
+// one path it can serve outside its mounts. Some clients read it at startup
+// to check their token, and do not start without it (docs/compat.md).
+//
+// The request is authorized with the operation OpTokenLookup and no mount ID
+// and key name. The answer describes a token that never expires and cannot be
+// renewed, whatever the token is: the server knows nothing about it but the
+// authorizer's verdict.
+func WithTokenLookup() Option {
+	return func(c *config) error {
+		c.tokenLookup = true
+		return nil
+	}
+}
+
 // Server is an http.Handler that serves the Vault Transit API for its mounts.
-// It serves nothing outside of them.
+// Outside of them it serves nothing, or with WithTokenLookup one path.
 type Server struct {
 	mounts          []*mount // longest prefix first
 	authorizer      Authorizer
@@ -149,6 +169,7 @@ type Server struct {
 	decryptFlight singleflight.Group
 	warmOnDatakey bool
 	auditHook     AuditHook
+	tokenLookup   bool
 
 	// deletionAllowed holds the keys whose config set deletion_allowed, for
 	// mounts with RequireDeletionAllowed.
@@ -184,6 +205,7 @@ func NewServer(opts ...Option) (*Server, error) {
 		maxBodySize:     c.maxBodySize,
 		bodyReadTimeout: c.bodyReadTimeout,
 		auditHook:       c.auditHook,
+		tokenLookup:     c.tokenLookup,
 		deletionAllowed: map[keyID]struct{}{},
 	}
 	if c.cache != nil {
@@ -244,11 +266,13 @@ func parseOp(method, rest string) (Op, string, error) {
 		return OpKeyCreate, name, nil
 	case method == http.MethodDelete:
 		return OpKeyDelete, name, nil
-	case method == http.MethodGet:
-		// reading key metadata is not supported (DESIGN.md D7)
+	case name == "":
+		// not a key: listing keys is not supported
 		return "", "", errUnsupportedPath
+	case method == http.MethodGet:
+		return OpKeyRead, name, nil
 	}
-	return "", "", methodNotAllowed("POST, PUT, DELETE")
+	return "", "", methodNotAllowed("GET, POST, PUT, DELETE")
 }
 
 // request is the state of one request being served.
@@ -260,6 +284,8 @@ type request struct {
 	mount    *mount
 	keyName  string
 	cacheHit bool
+	// bodyRead says that the request body was read, or given up reading.
+	bodyRead bool
 }
 
 func (req *request) keyID() keyID { return keyID{req.mount.id, req.keyName} }
@@ -284,6 +310,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var status int
 	switch {
 	case err != nil:
+		if !req.bodyRead && r.ContentLength != 0 {
+			// The request was refused before its body was looked at (no
+			// such route, wrong method, invalid key name). net/http would
+			// now read the body to keep the connection, before it sends the
+			// answer and with no time limit: a client that announced a body
+			// and withholds it would get no answer and hold the connection.
+			// Giving the connection up makes it skip that.
+			w.Header().Set("Connection", "close")
+		}
 		status = s.writeError(w, r, req, err)
 	case res.data == nil:
 		status = http.StatusNoContent
@@ -319,6 +354,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*result, error) {
+	if s.tokenLookup && r.URL.Path == tokenLookupPath {
+		return s.handleTokenLookup(w, r, req)
+	}
 	m, rest, ok := s.route(r.URL.EscapedPath())
 	if !ok {
 		return nil, notFound("no handler for route")
@@ -347,24 +385,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 	// authorizer is told the context. A body that cannot be used is reported
 	// only after that: a client that is not allowed in gets a 403 whatever it
 	// sent.
+	req.bodyRead = true
 	body, bodyErr := s.readBody(w, r)
 	if bodyErr == nil {
 		req.context, bodyErr = requestContext(op, body)
 	}
-	if s.authorizer != nil {
-		err := s.authorizer(r.Context(), AuthRequest{
-			Op:         op,
-			MountID:    m.id,
-			KeyName:    name,
-			Context:    bytes.Clone(req.context),
-			Token:      r.Header.Get("X-Vault-Token"),
-			Namespace:  r.Header.Get("X-Vault-Namespace"),
-			TLS:        r.TLS,
-			RemoteAddr: r.RemoteAddr,
-		})
-		if err != nil {
-			return nil, err
-		}
+	if err := s.authorize(r, req); err != nil {
+		return nil, err
 	}
 	if bodyErr != nil {
 		return nil, bodyErr
@@ -382,8 +409,63 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 		return s.handleKeyConfig(req, body)
 	case OpKeyDelete:
 		return s.handleKeyDelete(r.Context(), req)
+	case OpKeyRead:
+		return s.handleKeyRead(r.Context(), req)
 	}
 	return nil, fmt.Errorf("unhandled operation %q", op)
+}
+
+// authorize asks the authorizer, if there is one, about the request.
+func (s *Server) authorize(r *http.Request, req *request) error {
+	if s.authorizer == nil {
+		return nil
+	}
+	ar := AuthRequest{
+		Op:         req.op,
+		KeyName:    req.keyName,
+		Context:    bytes.Clone(req.context),
+		Token:      r.Header.Get("X-Vault-Token"),
+		Namespace:  r.Header.Get("X-Vault-Namespace"),
+		TLS:        r.TLS,
+		RemoteAddr: r.RemoteAddr,
+	}
+	if req.mount != nil {
+		ar.MountID = req.mount.id
+	}
+	return s.authorizer(r.Context(), ar)
+}
+
+// tokenLookupData is the "data" of the lookup-self answer: the fields of
+// Vault's that say how long the token lives. Clients use them to decide
+// whether to renew it; with these values they do not. The token itself and
+// its accessor, which Vault also returns, are left out.
+type tokenLookupData struct {
+	CreationTTL int      `json:"creation_ttl"`
+	ExpireTime  *string  `json:"expire_time"`
+	Policies    []string `json:"policies"`
+	Renewable   bool     `json:"renewable"`
+	TTL         int      `json:"ttl"`
+	Type        string   `json:"type"`
+}
+
+func (s *Server) handleTokenLookup(w http.ResponseWriter, r *http.Request, req *request) (*result, error) {
+	req.op = OpTokenLookup
+	if r.Method != http.MethodGet {
+		return nil, methodNotAllowed("GET")
+	}
+	// A lookup has no use for a body, but one that is announced is read
+	// within the same limits as everywhere else: left alone, net/http would
+	// wait for it without any, after the answer. As everywhere else, what is
+	// wrong with it is reported only to a client that is allowed in.
+	req.bodyRead = true
+	_, bodyErr := s.readBody(w, r)
+	if err := s.authorize(r, req); err != nil {
+		return nil, err
+	}
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+	return &result{data: &tokenLookupData{Policies: []string{"default"}, Type: "service"}}, nil
 }
 
 // readBody reads the whole request body, up to the size limit and within the
@@ -746,6 +828,75 @@ func (s *Server) handleKeyDelete(ctx context.Context, req *request) (*result, er
 	return noContent, nil
 }
 
+// errKeyAbsent answers the read of a key that does not exist the way Vault
+// does: 404 with an empty list of errors. Vault's clients take exactly that
+// as "no such key" and anything else as a failure.
+var errKeyAbsent = notFound("")
+
+// keyReadData is the "data" of a key read: the fields Vault returns for an
+// aes256-gcm96 key that is not derived, which is what a transhim key looks
+// like from outside. Only latest_version, keys, and deletion_allowed vary.
+type keyReadData struct {
+	AllowPlaintextBackup bool `json:"allow_plaintext_backup"`
+	AutoRotatePeriod     int  `json:"auto_rotate_period"`
+	DeletionAllowed      bool `json:"deletion_allowed"`
+	Derived              bool `json:"derived"`
+	Exportable           bool `json:"exportable"`
+	ImportedKey          bool `json:"imported_key"`
+	// Keys maps a version to its creation time in Unix seconds. Only the
+	// latest version is listed.
+	Keys                 map[string]int64 `json:"keys"`
+	LatestVersion        int              `json:"latest_version"`
+	MinAvailableVersion  int              `json:"min_available_version"`
+	MinDecryptionVersion int              `json:"min_decryption_version"`
+	MinEncryptionVersion int              `json:"min_encryption_version"`
+	Name                 string           `json:"name"`
+	SoftDeleted          bool             `json:"soft_deleted"`
+	SupportsDecryption   bool             `json:"supports_decryption"`
+	// SupportsDerivation is true as it is in Vault for this key type; here it
+	// says that a context is accepted.
+	SupportsDerivation bool   `json:"supports_derivation"`
+	SupportsEncryption bool   `json:"supports_encryption"`
+	SupportsSigning    bool   `json:"supports_signing"`
+	Type               string `json:"type"`
+}
+
+func (s *Server) handleKeyRead(ctx context.Context, req *request) (*result, error) {
+	m := req.mount
+	// Without a KeyDescriber the server cannot tell whether the key exists,
+	// and says that it does.
+	var info KeyInfo
+	if m.describer != nil {
+		var err error
+		info, err = m.describer.DescribeKey(ctx, m.id, req.keyName)
+		if errors.Is(err, ErrKeyNotFound) {
+			return nil, errKeyAbsent
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	version := max(info.Version, 1)
+	var created int64
+	if !info.CreatedAt.IsZero() {
+		created = info.CreatedAt.Unix()
+	}
+	s.mu.Lock()
+	_, deletionAllowed := s.deletionAllowed[req.keyID()]
+	s.mu.Unlock()
+	return &result{data: &keyReadData{
+		DeletionAllowed:      deletionAllowed,
+		Keys:                 map[string]int64{strconv.Itoa(version): created},
+		LatestVersion:        version,
+		MinDecryptionVersion: 1,
+		Name:                 req.keyName,
+		SupportsDecryption:   true,
+		SupportsDerivation:   true,
+		SupportsEncryption:   true,
+		Type:                 "aes256-gcm96",
+	}}, nil
+}
+
 // response is Vault's response envelope. Clients only need "data"; the other
 // fields are there, with zero values, because Vault always sends them.
 type response struct {
@@ -799,7 +950,11 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, req *request
 	if re, ok := errors.AsType[*requestError](err); ok && re.allow != "" {
 		w.Header().Set("Allow", re.allow)
 	}
-	writeJSON(w, status, errorBody{Errors: []string{msg}})
+	body := errorBody{Errors: []string{}}
+	if msg != "" {
+		body.Errors = append(body.Errors, msg)
+	}
+	writeJSON(w, status, body)
 	return status
 }
 

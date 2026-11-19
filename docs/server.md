@@ -51,7 +51,7 @@ func run(ctx context.Context) error {
 }
 ```
 
-`*transhim.Server` is an `http.Handler`. It serves the Transit API below its mounts and answers `404` for everything else. Listening, TLS, and shutdown are yours.
+`*transhim.Server` is an `http.Handler`. It serves the Transit API below its mounts and answers `404` for everything else (with `WithTokenLookup`, one more path). Listening, TLS, and shutdown are yours.
 
 ## Decisions you cannot change later
 
@@ -160,6 +160,7 @@ A wrapper like this hides the optional interfaces below. If the wrapped backend 
 ### Optional interfaces
 
 - `DataKeyGenerator`: implement it if the KMS has a "generate data key" call. Otherwise the server generates data keys itself and wraps them with `Encrypt`.
+- `KeyDescriber`: implement it if the backend can tell cheaply whether a key exists. It answers clients that read a key (`GET keys/{name}`) before they use it. Without it, every key is reported as existing. The hierarchical backend implements it with one `KeyStore` read.
 - `KeyLifecycle`: implement it to create and delete keys when the client asks. RGW does for SSE-S3, one key per bucket. Usually you do not implement this yourself but use the hierarchical backend. Without it, key requests succeed and do nothing; `RejectUnmanagedKeyOps` on the mount answers them with `405` instead.
 
 ### Test it
@@ -278,6 +279,7 @@ func tokenOK(token string) bool {
 - Return an error wrapping `ErrPermissionDenied` to answer `403`. RGW shows it to the S3 client as `403 AccessDenied`.
 - A backend can also refuse key names, but it is not called for decrypts answered from the cache. Rules that must hold for every request belong here.
 - For mutual TLS, set `ClientAuth: tls.RequireAndVerifyClientCert` and `ClientCAs` in the `http.Server`'s `TLSConfig`, and check `req.TLS.VerifiedChains[0][0]` (its subject or SANs) in the authorizer. RGW's side is `rgw_crypt_vault_ssl_clientcert` and `rgw_crypt_vault_ssl_clientkey`.
+- Refuse the operations you do not expect. Besides the six that RGW uses there are `OpKeyRead` (`GET keys/{name}`: whether a key exists) and, with `WithTokenLookup`, `OpTokenLookup`, which comes with an empty mount ID and key name.
 - `transhim.AllowUnauthenticated()` builds a server without an authorizer. Such a server hands data keys to anyone who can reach it.
 
 ## Per-bucket keys
@@ -364,6 +366,7 @@ Choose the TTLs as the longest time you accept for such a revocation. A key name
 | `WithBodyReadTimeout` | 10 s | rarely. It limits how long a client may take to send its body, which is read before the request is authorized; a client that is too slow gets `408` |
 | `RequireDeletionAllowed` (mount) | off | to refuse `DELETE keys/{name}` unless the client set `deletion_allowed` first, as Vault does. RGW sets it. The flag is kept in memory only |
 | `RejectUnmanagedKeyOps` (mount) | off | to answer key requests with `405` on a mount whose keys are provisioned by hand. Do not use it on a mount RGW uses for SSE-S3 |
+| `WithTokenLookup` | off | for a client that reads `/v1/auth/token/lookup-self` to check its token and does not start without it (a Kubernetes KMS plugin). The answer says that the authorizer accepts the token, and that it never expires |
 | `WithLogger` | `slog.Default()` | to send the server's own log elsewhere |
 
 ## Running it
@@ -376,7 +379,7 @@ In the `http.Server`, set `ReadHeaderTimeout`. The server limits the time for th
 
 ### Health checks
 
-The server answers nothing outside its mounts. Add a health check in front of it:
+The server answers nothing outside its mounts (but the token lookup, if you enabled it). Add a health check in front of it:
 
 ```go
 func withHealthCheck(srv http.Handler) http.Handler {

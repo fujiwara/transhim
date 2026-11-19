@@ -2,3 +2,4 @@
 [tools]
 sops = "3.13.3" # integration/, TestSops
 openbao = "2.7.2" # integration/, TestOpenBaoTransitSeal
+"github:FalcoSuessgott/vault-kubernetes-kms" = "1.4.0" # integration/, TestKubernetesKMSPlugin
