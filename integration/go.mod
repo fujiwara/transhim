@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.21.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10
 	github.com/aws/smithy-go v1.28.9
-	github.com/fujiwara/transhim v0.2.0
+	github.com/fujiwara/transhim v0.3.0
 	google.golang.org/grpc v1.85.0
 	k8s.io/kms v0.37.2
 )
