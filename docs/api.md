@@ -265,4 +265,4 @@ The request is passed to the authorizer with the operation `token_lookup`, an em
 | `policies` | `["default"]` |
 | `type` | `service` |
 
-The token itself, its accessor, and the other fields of Vault's answer are left out: the server knows nothing about a token but the authorizer's verdict. Other methods are `405`. Nothing else below `/v1/auth/` is served: no `renew-self`, no login.
+The token itself, its accessor, and the other fields of Vault's answer are left out: the server knows nothing about a token but the authorizer's verdict. A request body is not used, but read within the usual limits. Other methods are `405`. Nothing else below `/v1/auth/` is served: no `renew-self`, no login.

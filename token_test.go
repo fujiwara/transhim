@@ -1,14 +1,18 @@
 package transhim_test
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fujiwara/transhim"
 	"github.com/fujiwara/transhim/transhimtest"
@@ -73,6 +77,45 @@ func TestTokenLookup(t *testing.T) {
 		if ev := events[i]; ev.Op != transhim.OpTokenLookup || ev.MountID != "" || ev.KeyName != "" || ev.Status != status {
 			t.Errorf("audit event %d = %+v, want token_lookup with status %d", i, ev, status)
 		}
+	}
+}
+
+// TestTokenLookupBody: a body is read within the server's limits, although
+// the lookup does not use it.
+func TestTokenLookupBody(t *testing.T) {
+	e := newEnv(t, transhim.WithTokenLookup(), transhim.WithMaxBodySize(16))
+	if r := e.do(http.MethodGet, lookupPath, `{"a":1}`); r.status != http.StatusOK {
+		t.Errorf("with a body: got %d %q, want 200", r.status, r.body)
+	}
+	big := strings.Repeat("x", 17)
+	r := e.do(http.MethodGet, lookupPath, big)
+	if r.status != http.StatusRequestEntityTooLarge || r.header.Get("Connection") != "close" {
+		t.Errorf("with a body over the limit: got %d, Connection %q; want 413 and close", r.status, r.header.Get("Connection"))
+	}
+	// a client that is not allowed in learns nothing about its body
+	req := httptest.NewRequest(http.MethodGet, lookupPath, strings.NewReader(big))
+	e.wantError(e.send(req), 403, "permission denied")
+}
+
+// TestTokenLookupBodyTimeout: a client that announces a body and does not
+// send it is answered when the time limit passes, not kept waiting for.
+func TestTokenLookupBodyTimeout(t *testing.T) {
+	e := newEnv(t, transhim.WithTokenLookup(), transhim.WithBodyReadTimeout(200*time.Millisecond))
+	ts := httptest.NewServer(e.handler)
+	defer ts.Close()
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nX-Vault-Token: %s\r\nContent-Length: 1\r\n\r\n", lookupPath, testToken)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no answer although the body read timed out: %v", err)
+	}
+	if res.StatusCode != http.StatusRequestTimeout || !res.Close {
+		t.Errorf("got %d, close %v; want 408 and a closed connection", res.StatusCode, res.Close)
 	}
 }
 

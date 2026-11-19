@@ -344,7 +344,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*result, error) {
 	if s.tokenLookup && r.URL.Path == tokenLookupPath {
-		return s.handleTokenLookup(r, req)
+		return s.handleTokenLookup(w, r, req)
 	}
 	m, rest, ok := s.route(r.URL.EscapedPath())
 	if !ok {
@@ -436,13 +436,21 @@ type tokenLookupData struct {
 	Type        string   `json:"type"`
 }
 
-func (s *Server) handleTokenLookup(r *http.Request, req *request) (*result, error) {
+func (s *Server) handleTokenLookup(w http.ResponseWriter, r *http.Request, req *request) (*result, error) {
 	req.op = OpTokenLookup
 	if r.Method != http.MethodGet {
 		return nil, methodNotAllowed("GET")
 	}
+	// A lookup has no use for a body, but one that is announced is read
+	// within the same limits as everywhere else: left alone, net/http would
+	// wait for it without any, after the answer. As everywhere else, what is
+	// wrong with it is reported only to a client that is allowed in.
+	_, bodyErr := s.readBody(w, r)
 	if err := s.authorize(r, req); err != nil {
 		return nil, err
+	}
+	if bodyErr != nil {
+		return nil, bodyErr
 	}
 	return &result{data: &tokenLookupData{Policies: []string{"default"}, Type: "service"}}, nil
 }
