@@ -17,7 +17,9 @@ type mount struct {
 	backend          Backend
 	maxPlaintextSize int
 	// lifecycle is the backend's KeyLifecycle, or nil.
-	lifecycle              KeyLifecycle
+	lifecycle KeyLifecycle
+	// describer is the backend's KeyDescriber, or nil.
+	describer              KeyDescriber
 	rejectUnmanagedKeyOps  bool
 	requireDeletionAllowed bool
 }
@@ -94,6 +96,7 @@ func Mount(prefix, mountID string, backend Backend, opts ...MountOption) Option 
 			}
 		}
 		m.lifecycle, _ = backend.(KeyLifecycle)
+		m.describer, _ = backend.(KeyDescriber)
 		for _, other := range c.mounts {
 			if other.prefix == m.prefix {
 				return fmt.Errorf("mount %q: prefix is already mounted", prefix)

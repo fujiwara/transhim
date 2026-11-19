@@ -998,6 +998,53 @@ func (s readOnlyStore) Delete(context.Context, string, string) error {
 
 // TestReadOnly: a read-only backend serves the keys another backend manages
 // on the same store, and never writes to it.
+func TestDescribeKey(t *testing.T) {
+	ctx := t.Context()
+	f := newFixture(t)
+	var _ transhim.KeyDescriber = f.b
+
+	if _, err := f.b.DescribeKey(ctx, mountID, bucket); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("DescribeKey of a missing key: err = %v, want ErrKeyNotFound", err)
+	}
+	before := time.Now().Add(-time.Second)
+	if err := f.b.CreateKey(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	e, d := f.rootCalls()
+	info, err := f.b.DescribeKey(ctx, mountID, bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Version != 1 || info.CreatedAt.Before(before) || info.CreatedAt.After(time.Now().Add(time.Second)) {
+		t.Errorf("DescribeKey = %+v, want version 1 created now", info)
+	}
+	// it reads the store only
+	if e2, d2 := f.rootCalls(); e2 != e || d2 != d {
+		t.Errorf("DescribeKey called the root backend")
+	}
+	if _, err := f.b.DescribeKey(ctx, "other-mount", bucket); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("DescribeKey on another mount: err = %v, want ErrKeyNotFound", err)
+	}
+
+	// a key deleted behind the backend's back is gone at once, cached or not
+	encrypt(t, f.b, bucket, "p", "aad")
+	if err := f.store.Delete(ctx, mountID, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.b.DescribeKey(ctx, mountID, bucket); !errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("DescribeKey of a deleted key: err = %v, want ErrKeyNotFound", err)
+	}
+
+	// a store failure is not "no such key"
+	failing, err := hierarchical.New(f.root, rootKey, failingStore{errors.New("db down")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failing.DescribeKey(ctx, mountID, bucket); err == nil || errors.Is(err, transhim.ErrKeyNotFound) {
+		t.Errorf("DescribeKey with a failing store: err = %v", err)
+	}
+}
+
 func TestReadOnly(t *testing.T) {
 	ctx := t.Context()
 	f := newFixture(t) // the provisioning side

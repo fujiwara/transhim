@@ -4,8 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/fujiwara/transhim"
 	"github.com/fujiwara/transhim/transhimtest"
@@ -124,11 +129,10 @@ func TestKeyOps(t *testing.T) {
 		}
 	})
 	t.Run("methods", func(t *testing.T) {
-		// reading keys is not part of v1
-		for _, path := range []string{"/v1/transit-kms/keys/key1", "/v1/transit-kms/keys", "/v1/transit-kms/keys/"} {
-			if r := e.do(http.MethodGet, path, ""); r.status != http.StatusNotFound {
-				t.Errorf("GET %s: got %d, want 404", path, r.status)
-			}
+		// listing keys is not supported
+		for _, path := range []string{"/v1/transit-kms/keys", "/v1/transit-kms/keys/"} {
+			e.wantError(e.do(http.MethodGet, path, ""), 404, "unsupported path")
+			e.wantError(e.do("LIST", path, ""), 404, "unsupported path")
 		}
 		for method, path := range map[string]string{
 			http.MethodPatch:  "/v1/transit-kms/keys/key1",
@@ -154,6 +158,115 @@ func TestKeyOps(t *testing.T) {
 	})
 }
 
+// TestKeyRead covers GET keys/{name}: what clients that check a key before
+// they use it get to see.
+func TestKeyRead(t *testing.T) {
+	// The answer has the fields OpenBao gives for a key of this type
+	// (testdata/capture, "read key").
+	const fields = "allow_plaintext_backup auto_rotate_period deletion_allowed derived exportable imported_key keys " +
+		"latest_version min_available_version min_decryption_version min_encryption_version name soft_deleted " +
+		"supports_decryption supports_derivation supports_encryption supports_signing type"
+
+	t.Run("backend that describes keys", func(t *testing.T) {
+		e := newEnv(t)
+		r := e.do(http.MethodGet, "/v1/transit-kms/keys/key1", "")
+		if r.status != http.StatusOK {
+			t.Fatalf("got %d %q, want 200", r.status, r.body)
+		}
+		if got := strings.Join(slices.Sorted(maps.Keys(r.Data)), " "); got != fields {
+			t.Errorf("data fields:\n got %s\nwant %s", got, fields)
+		}
+		for field, want := range map[string]any{
+			"name": "key1", "type": "aes256-gcm96", "latest_version": 1.0, "min_decryption_version": 1.0,
+			"deletion_allowed": false, "exportable": false, "derived": false,
+			"supports_encryption": true, "supports_decryption": true,
+		} {
+			if r.Data[field] != want {
+				t.Errorf("%s = %v, want %v", field, r.Data[field], want)
+			}
+		}
+		if keys, _ := r.Data["keys"].(map[string]any); len(keys) != 1 || keys["1"] != 0.0 {
+			t.Errorf("keys = %v, want version 1 without a creation time", r.Data["keys"])
+		}
+		if got := e.backend.Calls(transhimtest.OpDescribeKey); got != 1 {
+			t.Errorf("DescribeKey calls = %d, want 1", got)
+		}
+
+		// A missing key is answered as Vault does: its clients take a 404
+		// without a message as "no such key".
+		r = e.do(http.MethodGet, "/v1/transit-kms/keys/nokey", "")
+		if r.status != http.StatusNotFound || strings.TrimSpace(string(r.body)) != `{"errors":[]}` {
+			t.Errorf("missing key: got %d %q, want 404 with no errors", r.status, r.body)
+		}
+		// the same name on another mount is another key
+		e.backend.AddKey("kms", "only-kms")
+		if r := e.do(http.MethodGet, "/v1/transit-sse-s3/keys/only-kms", ""); r.status != http.StatusNotFound {
+			t.Errorf("key of another mount: got %d, want 404", r.status)
+		}
+
+		e.backend.SetError(transhimtest.OpDescribeKey, &transhim.UpstreamError{Err: errors.New("SECRET"), Retryable: true})
+		e.wantError(e.do(http.MethodGet, "/v1/transit-kms/keys/key1", ""), 503, "upstream key service error")
+		if !strings.Contains(e.logs.String(), "SECRET") {
+			t.Error("the backend error was not logged")
+		}
+	})
+
+	t.Run("version and creation time", func(t *testing.T) {
+		created := time.Date(2026, 11, 19, 1, 2, 3, 0, time.UTC)
+		backend := describing{transhimtest.NewFakeBackend(), transhim.KeyInfo{Version: 7, CreatedAt: created}}
+		e := newEnv(t, transhim.Mount("/v1/described", "described", backend))
+		r := e.do(http.MethodGet, "/v1/described/keys/any", "")
+		if r.status != http.StatusOK || r.Data["latest_version"] != 7.0 {
+			t.Fatalf("got %d %q, want latest_version 7", r.status, r.body)
+		}
+		if keys, _ := r.Data["keys"].(map[string]any); len(keys) != 1 || keys["7"] != float64(created.Unix()) {
+			t.Errorf("keys = %v, want version 7 created at %d", r.Data["keys"], created.Unix())
+		}
+	})
+
+	t.Run("backend that cannot tell", func(t *testing.T) {
+		e := newEnv(t, transhim.Mount("/v1/plain", "plain", plainBackend{transhimtest.NewFakeBackend()}))
+		// any key is reported as existing, in version 1
+		r := e.do(http.MethodGet, "/v1/plain/keys/whatever", "")
+		if r.status != http.StatusOK || r.Data["latest_version"] != 1.0 || r.Data["name"] != "whatever" {
+			t.Errorf("got %d %q, want 200 with latest_version 1", r.status, r.body)
+		}
+	})
+
+	t.Run("deletion_allowed", func(t *testing.T) {
+		e := newEnv(t, transhim.Mount("/v1/latched", "latched", transhimtest.NewFakeBackend(), transhim.RequireDeletionAllowed()))
+		e.want204(e.do(http.MethodPost, "/v1/latched/keys/k", ""))
+		e.want204(e.do(http.MethodPost, "/v1/latched/keys/k/config", rgwConfigBody))
+		if r := e.do(http.MethodGet, "/v1/latched/keys/k", ""); r.Data["deletion_allowed"] != true {
+			t.Errorf("deletion_allowed = %v after config, want true", r.Data["deletion_allowed"])
+		}
+	})
+
+	t.Run("requests", func(t *testing.T) {
+		e := newEnv(t)
+		for _, path := range []string{"/v1/transit-kms/keys/a/b", "/v1/transit-kms/keys/a%2Fb"} {
+			if r := e.do(http.MethodGet, path, ""); r.status != http.StatusBadRequest {
+				t.Errorf("GET %s: got %d %q, want 400", path, r.status, r.body)
+			}
+		}
+		req := httptest.NewRequest(http.MethodGet, "/v1/transit-kms/keys/key1", nil)
+		e.wantError(e.send(req), 403, "permission denied") // no token
+		if got := e.backend.Calls(transhimtest.OpDescribeKey); got != 0 {
+			t.Errorf("DescribeKey calls = %d, want 0", got)
+		}
+	})
+}
+
+// describing is a backend whose keys all exist, with the same KeyInfo.
+type describing struct {
+	transhim.Backend
+	info transhim.KeyInfo
+}
+
+func (d describing) DescribeKey(context.Context, string, string) (transhim.KeyInfo, error) {
+	return d.info, nil
+}
+
 func TestKeyOpsAuthorization(t *testing.T) {
 	var got []transhim.AuthRequest
 	deny := false
@@ -166,8 +279,9 @@ func TestKeyOpsAuthorization(t *testing.T) {
 	}))
 	e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b1", rgwCreateBody)
 	e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b1/config", rgwConfigBody)
+	e.do(http.MethodGet, "/v1/transit-sse-s3/keys/b1", "")
 	e.do(http.MethodDelete, "/v1/transit-sse-s3/keys/b1", "")
-	want := []transhim.Op{transhim.OpKeyCreate, transhim.OpKeyConfig, transhim.OpKeyDelete}
+	want := []transhim.Op{transhim.OpKeyCreate, transhim.OpKeyConfig, transhim.OpKeyRead, transhim.OpKeyDelete}
 	if len(got) != len(want) {
 		t.Fatalf("authorizer called %d times, want %d", len(got), len(want))
 	}
@@ -181,7 +295,8 @@ func TestKeyOpsAuthorization(t *testing.T) {
 	e.wantError(e.do(http.MethodPost, "/v1/transit-sse-s3/keys/b2", rgwCreateBody), 403, "permission denied")
 	e.wantError(e.do(http.MethodPost, "/v1/transit-sse-s3/keys/key1/config", rgwConfigBody), 403, "permission denied")
 	e.wantError(e.do(http.MethodDelete, "/v1/transit-sse-s3/keys/key1", ""), 403, "permission denied")
-	if e.backend.HasKey("sse", "b2") || !e.backend.HasKey("sse", "key1") {
+	e.wantError(e.do(http.MethodGet, "/v1/transit-sse-s3/keys/key1", ""), 403, "permission denied")
+	if e.backend.HasKey("sse", "b2") || !e.backend.HasKey("sse", "key1") || e.backend.Calls(transhimtest.OpDescribeKey) != 1 {
 		t.Error("a denied key operation reached the backend")
 	}
 }

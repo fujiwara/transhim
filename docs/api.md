@@ -1,6 +1,6 @@
 # HTTP API
 
-transhim serves a subset of the [Vault Transit secrets engine API](https://developer.hashicorp.com/vault/api-docs/secret/transit): the endpoints Ceph RGW calls, plus `encrypt`. This page lists them, says what the server does for each, and where that differs from Vault.
+transhim serves a subset of the [Vault Transit secrets engine API](https://developer.hashicorp.com/vault/api-docs/secret/transit): the endpoints Ceph RGW calls, plus `encrypt` and the read of a key. This page lists them, says what the server does for each, and where that differs from Vault.
 
 For how RGW uses these endpoints, see [compat.md](compat.md). For writing the server, see [server.md](server.md).
 
@@ -16,6 +16,8 @@ For how RGW uses these endpoints, see [compat.md](compat.md). For writing the se
 | `POST {prefix}/keys/{name}` | `key_create` | creates the key, if the backend manages keys |
 | `POST {prefix}/keys/{name}/config` | `key_config` | accepts `deletion_allowed` |
 | `DELETE {prefix}/keys/{name}` | `key_delete` | deletes the key, if the backend manages keys |
+| `GET {prefix}/keys/{name}` | `key_read` | says whether the key exists, and its version |
+| `GET /v1/auth/token/lookup-self` | `token_lookup` | only with `WithTokenLookup`: says that the token is accepted |
 
 `PUT` is accepted wherever `POST` is. The operation names are the values of `transhim.Op`, as authorizers and audit hooks see them.
 
@@ -23,12 +25,11 @@ Not served:
 
 | request | answer |
 |---|---|
-| `GET {prefix}/keys/{name}` (read a key) | `404` |
 | `datakey/wrapped`, `rewrap`, `sign`, `verify`, `hmac`, `random`, `export`, `backup`, and every other Transit path | `404` |
 | `LIST {prefix}/keys` | `404` |
 | `keys/{name}/rotate`, and anything else below `keys/{name}/` but `config` | `400 invalid key name`: it is read as a key name with a `/` in it |
 | `batch_input` in `encrypt` and `decrypt` | ignored: the request is handled as a single one and fails for its missing field |
-| anything outside a mount: `/v1/sys/*`, `/v1/auth/*` | `404` |
+| anything outside a mount: `/v1/sys/*`, `/v1/auth/*` (but `lookup-self` with `WithTokenLookup`) | `404` |
 
 There are no Vault tokens, policies, or leases. The token is whatever the server's authorizer accepts.
 
@@ -44,7 +45,7 @@ There are no Vault tokens, policies, or leases. The token is whatever the server
 
 ### Order of checks
 
-1. No mount matches the path: `404 no handler for route`.
+1. No mount matches the path: `404 no handler for route`. (The token lookup, where it is enabled, is matched before the mounts.)
 2. The path below the mount is no operation: `404 unsupported path` (logged as a warning). A known operation with another method: `405` with an `Allow` header.
 3. The key name is invalid: `400 invalid key name`.
 4. The authorizer refuses: `403 permission denied`. The body has been read by then, but nothing about it is reported before this point.
@@ -68,7 +69,7 @@ Successful answers with data are `200` and have Vault's shape. Only `data` carri
 }
 ```
 
-The key operations answer `204` with no body at all.
+Key create, config, and delete answer `204` with no body at all.
 
 Errors have Vault's shape, with one message:
 
@@ -87,6 +88,7 @@ All answers with a body are `Content-Type: application/json` and `Cache-Control:
 | `400` | `invalid request`, or one of the messages on this page | the request is wrong |
 | `403` | `permission denied` | the authorizer or the backend refuses |
 | `404` | `no handler for route`, `unsupported path` | see above |
+| `404` | none: `{"errors":[]}` | the read of a key that does not exist (as Vault answers) |
 | `405` | `unsupported operation` | wrong method; or a key operation on a mount with `RejectUnmanagedKeyOps` |
 | `408` | `request body not received in time` | |
 | `413` | `request body too large` | |
@@ -222,3 +224,45 @@ For a client that only uses the endpoints above, these are the differences in be
 | key versions, rotation, `min_decryption_version` | supported | not there; rotation is the KMS's business |
 
 The reference answers were recorded from OpenBao 2.7.2 (see [compat.md](compat.md)).
+
+## `GET keys/{name}`
+
+Reads a key. Some clients do before they use one: to see that it exists, or to learn its version (a Kubernetes KMS plugin reports `latest_version` to Kubernetes as the key ID).
+
+The answer has the fields Vault returns for an `aes256-gcm96` key:
+
+| `data` field | |
+|---|---|
+| `name` | the key name |
+| `latest_version` | the key's version, `1` unless the backend says otherwise |
+| `keys` | `{"<latest_version>": <creation time>}`, in Unix seconds, `0` if unknown. Older versions are not listed |
+| `deletion_allowed` | `true` after `config` set it, on a mount with `RequireDeletionAllowed`; otherwise `false` |
+| `type` | always `aes256-gcm96`, whatever the backend uses |
+| `min_decryption_version` | always `1` |
+| `supports_encryption`, `supports_decryption`, `supports_derivation` | always `true` |
+| `exportable`, `derived`, `allow_plaintext_backup`, `imported_key`, `soft_deleted`, `supports_signing` | always `false` |
+| `auto_rotate_period`, `min_encryption_version`, `min_available_version` | always `0` |
+
+How it is processed:
+
+- If the backend implements `KeyDescriber` (the hierarchical backend does), `DescribeKey` is called. A key it does not know is answered with `404` and an empty list of errors, as Vault does: `{"errors":[]}`.
+- Otherwise the server cannot tell, and **every key is reported as existing**, in version 1. A client learns that a key is missing when it uses it (`400 encryption key not found`).
+- The decrypt cache is not involved.
+
+Nothing here says what the key is in the KMS: a transhim key looks the same from outside whatever the backend does.
+
+## `GET /v1/auth/token/lookup-self`
+
+Served only by a server built with `WithTokenLookup`. Some clients read it at startup to check their token and do not start without it (a Kubernetes KMS plugin, see [compat.md](compat.md)).
+
+The request is passed to the authorizer with the operation `token_lookup`, an empty mount ID, and an empty key name. If the authorizer allows it, the answer describes a token that never expires and cannot be renewed:
+
+| `data` field | |
+|---|---|
+| `ttl`, `creation_ttl` | `0` |
+| `renewable` | `false` |
+| `expire_time` | `null` |
+| `policies` | `["default"]` |
+| `type` | `service` |
+
+The token itself, its accessor, and the other fields of Vault's answer are left out: the server knows nothing about a token but the authorizer's verdict. Other methods are `405`. Nothing else below `/v1/auth/` is served: no `renew-self`, no login.

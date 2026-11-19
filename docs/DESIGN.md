@@ -34,7 +34,7 @@ The name means "**tran**sit **shim**".
 
 ### v1 scope rule
 
-**v1 is done when Ceph RGW SSE-KMS and SSE-S3 work.** v1 implements exactly the endpoints that RGW calls, plus `encrypt`. Anything that exists only for other clients is deferred (§3, D6–D9). If the M0 capture (§15) shows that RGW calls an endpoint listed as deferred, that endpoint moves back into v1.
+**v1 is done when Ceph RGW SSE-KMS and SSE-S3 work.** v1 implements exactly the endpoints that RGW calls, plus `encrypt`. Anything that exists only for other clients is deferred (§3, D6–D9). After v1, the read of a key and the token lookup were added for a Kubernetes KMS plugin (UC6). If the M0 capture (§15) shows that RGW calls an endpoint listed as deferred, that endpoint moves back into v1.
 
 ## 3. Non-Goals (explicitly out of scope)
 
@@ -57,8 +57,8 @@ Deferred to later versions (may be added later; do not implement now):
 - D3. `datakey/wrapped` (ciphertext-only datakey).
 - D4. Key rotation endpoints (`keys/{name}/rotate`).
 - D5. Built-in Prometheus metrics. v1 exposes hooks only.
-- D6. Token stubs `auth/token/lookup-self` and `renew-self` (§6.7). They were meant for go-kms-wrapping–based clients; OpenBao's transit seal turned out to work without them (compat.md). The Kubernetes KMS plugin vault-kubernetes-kms does need `lookup-self` (UC6).
-- D7. `GET keys/{name}` (§6.5) and the `KeyDescriber` interface. RGW is not expected to read key metadata. RustFS and vault-kubernetes-kms do (UC5, UC6).
+- D6. The token stub `auth/token/renew-self` (§6.7). It was meant for go-kms-wrapping–based clients; OpenBao's transit seal turned out to work without it (compat.md). `lookup-self` was deferred with it and is **done** (`WithTokenLookup`): vault-kubernetes-kms needs it (UC6).
+- D7. ~~`GET keys/{name}` (§6.5) and the `KeyDescriber` interface.~~ **Done**: RGW does not read key metadata, but vault-kubernetes-kms does (UC6).
 - D8. `GET /v1/sys/health` (§6.7). Users write their own `main` and can add a health handler to their mux.
 - D9. Verification and support claims for any client other than RGW (UC3–UC6).
 
@@ -112,11 +112,11 @@ Most of these use the go-kms-wrapping transit wrapper. That wrapper calls token 
 
 ### UC5. RustFS (verified: not supported)
 
-RustFS has a `vault-transit` KMS backend. Its request set was captured for RustFS 1.0.6 ([compat.md](compat.md)): it needs `LIST keys`, `GET keys/{name}` (D7), `associated_data` on `encrypt` and `decrypt`, and, outside Transit, a KV v2 engine at the same address for its key records. It does not work against transhim, and cannot with transhim alone.
+RustFS has a `vault-transit` KMS backend. Its request set was captured for RustFS 1.0.6 ([compat.md](compat.md)): it needs `LIST keys`, `GET keys/{name}` (not served then; see §6.5), `associated_data` on `encrypt` and `decrypt`, and, outside Transit, a KV v2 engine at the same address for its key records. It does not work against transhim, and cannot with transhim alone.
 
-### UC6. Kubernetes KMS plugin (verified: not supported)
+### UC6. Kubernetes KMS plugin (verified: works)
 
-vault-kubernetes-kms lets kube-apiserver encrypt Secrets with a Transit key. Its request set was captured for version 1.4.0 ([compat.md](compat.md)): besides `encrypt` and `decrypt` it needs `auth/token/lookup-self` (D6) at startup and `GET keys/{name}` (D7) for `latest_version`, which it reports to Kubernetes as the key ID. It does not work against transhim; with those two reads answered, it does.
+vault-kubernetes-kms lets kube-apiserver encrypt Secrets with a Transit key. Its request set was captured for version 1.4.0 ([compat.md](compat.md)): besides `encrypt` and `decrypt` it needs `auth/token/lookup-self` at startup and `GET keys/{name}` for `latest_version`, which it reports to Kubernetes as the key ID. Both were added for it (§6.5, §6.7); the server needs `WithTokenLookup`.
 
 ---
 
@@ -236,33 +236,32 @@ Response: 204 No Content with an **empty body**. This is deliberate and differs 
 
 Creating a key that already exists must leave the existing key untouched and succeed. RGW relies on this after `DeleteBucketEncryption` (§4, UC2).
 
-### 6.5 `GET {prefix}/keys/{name}` (read) — deferred (D7), not in v1
+### 6.5 `GET {prefix}/keys/{name}` (read)
 
-In v1 this path returns 404 like any unknown path. The specification below is kept for the later version.
+This is minimal metadata for clients that check whether a key exists, or read its version (vault-kubernetes-kms, UC6).
 
-This is minimal metadata for clients that check whether a key exists.
+Response `data`: exactly the fields OpenBao returns for an `aes256-gcm96` key that is not derived (the fixtures check this): `name`, `type` (`"aes256-gcm96"`), `latest_version`, `keys: {"<latest_version>": <unix time>}`, `deletion_allowed`, `min_decryption_version: 1`, `min_encryption_version: 0`, `min_available_version: 0`, `auto_rotate_period: 0`, `supports_encryption`, `supports_decryption`, and `supports_derivation` `true` (as OpenBao says for this type; a context is accepted), and `exportable`, `derived`, `allow_plaintext_backup`, `imported_key`, `soft_deleted`, `supports_signing` `false`.
 
-Response `data`: `name`, `type` (`"aes256-gcm96"`), `latest_version`, `min_decryption_version: 1`, `min_encryption_version: 0`, `deletion_allowed`, `exportable: false`, `derived: false`, `supports_encryption: true`, `supports_decryption: true`, `supports_derivation: false`, `supports_signing: false`, and `keys: {"1": <unix time>}`.
+If the backend implements `KeyDescriber`, use its information; a key it does not know is answered as Vault does, with 404 and `{"errors":[]}`, which Vault's clients take as "no such key". Otherwise, report existence as "unknown, assume exists" with version 1. `deletion_allowed` is what `config` recorded (§6.6), so it is only ever true on mounts with `RequireDeletionAllowed`.
 
-If the backend implements `KeyDescriber`, use its information. Otherwise, report existence as "unknown, assume exists" with version 1.
+`GET keys/` and `LIST keys` stay 404: there is no listing.
 
 ### 6.6 `POST {prefix}/keys/{name}/config` and `DELETE {prefix}/keys/{name}`
 
 - `config`: accept `deletion_allowed` (bool) and ignore all other fields. Record `deletion_allowed` in memory per `(mount_id, name)` (it is a best-effort safety latch; it does not need to be durable). It is only recorded on mounts with `RequireDeletionAllowed`, the only place where it is read, and dropped when the key is deleted. Respond 204 with an **empty body**. This is required, not cosmetic: RGW before tentacle treats a non-empty `config` response as a failure and then never sends the `DELETE` (compat.md). `config` on a key the backend does not know also answers 204, since transhim cannot tell in general.
 - `DELETE`: if the backend implements `KeyLifecycle`, call `DeleteKey`. Deletion is idempotent: a missing key returns success. Then **invalidate all cache entries** for that `(mount_id, name)`. Without `KeyLifecycle`, respond 204 without calling the backend (or 405 if `RejectUnmanagedKeyOps` is set); the cache entries are invalidated all the same, since the key may have been removed in the KMS.
-- `GET keys/{name}` answers 404 (D7). Other methods on `keys/...` answer 405.
+- Other methods on `keys/...` answer 405.
 - Mount option `RequireDeletionAllowed` (default false) rejects DELETE with 400 unless `config` was called first. It defaults to false because transhim may restart between the two calls.
 
-### 6.7 Token stubs and health — deferred (D6, D8), not in v1
+### 6.7 Token lookup; token renewal and health — deferred (D6, D8)
 
-In v1 the server serves nothing outside its mounts. The specification below is kept for the later version.
+Outside its mounts the server serves nothing, with one exception:
 
-Token stubs (outside mounts, under `/v1/auth/token/`) exist for go-kms-wrapping–based clients:
+- `GET /v1/auth/token/lookup-self`, enabled with `WithTokenLookup()` and off by default: runs the authorizer with op `token_lookup` and no mount ID and key name. On success, returns `data` with `renewable: false`, `ttl: 0`, `creation_ttl: 0`, `expire_time: null`, `policies: ["default"]`, and `type: "service"`. vault-kubernetes-kms reads `ttl` and `creation_ttl` and, with these values, never renews (compat.md). The token and its accessor, which Vault returns, are left out.
 
-- `GET /v1/auth/token/lookup-self`: runs the authorizer with op `token_lookup`. On success, returns `data` with `renewable: false`, `ttl: 0`, `creation_ttl: 0` (vault-kubernetes-kms reads it, compat.md), `expire_time: null`, `policies: ["default"]`, and `type: "service"`.
-- `POST /v1/auth/token/renew-self`: returns an `auth` block with `renewable: false` and `lease_duration: 0`.
+Deferred, with the specification kept for later:
 
-These stubs are disabled by default and enabled with `WithTokenStubs()`. **The implementer must verify** against the go-kms-wrapping source that `renewable: false` stops its renewal loop cleanly.
+- `POST /v1/auth/token/renew-self`: returns an `auth` block with `renewable: false` and `lease_duration: 0`. No client seen so far needs it: OpenBao's transit seal calls it once and goes on when it fails.
 
 `GET /v1/sys/health` returns 200 `{"initialized":true,"sealed":false,"standby":false}`. It is always enabled and requires no auth.
 
@@ -364,9 +363,12 @@ type KeyLifecycle interface {
     CreateKey(ctx context.Context, mountID, keyName string) error // idempotent
     DeleteKey(ctx context.Context, mountID, keyName string) error // idempotent
 }
-// Deferred (D7), not in v1.
 type KeyDescriber interface {
-    DescribeKey(ctx context.Context, mountID, keyName string) (KeyInfo, error)
+    DescribeKey(ctx context.Context, mountID, keyName string) (KeyInfo, error) // ErrKeyNotFound if absent
+}
+type KeyInfo struct {
+    Version   int       // latest_version; below 1 is reported as 1
+    CreatedAt time.Time // of that version, if known
 }
 ```
 
@@ -387,7 +389,7 @@ srv, err := transhim.NewServer(
 
 The mount ID is a positional argument of `Mount` rather than an option, so that omitting it is a compile error. `NewServer` validates it as described in §7.2.
 
-`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete` in v1; `key_read`, `token_lookup`, and `token_renew` arrive with D6/D7), `MountID`, `KeyName`, `Context` (the decoded context of datakey, encrypt, and decrypt requests, nil if it is absent or empty; the body is read before the authorizer runs, within `WithBodyReadTimeout` (default 10 s, answered with 408), and body errors are reported after it), `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
+`AuthRequest` contains: `Op` (`datakey|encrypt|decrypt|key_create|key_config|key_delete|key_read`, and `token_lookup` with `WithTokenLookup`, which has no mount ID and key name; `token_renew` would arrive with D6), `MountID`, `KeyName`, `Context` (the decoded context of datakey, encrypt, and decrypt requests, nil if it is absent or empty; the body is read before the authorizer runs, within `WithBodyReadTimeout` (default 10 s, answered with 408), and body errors are reported after it), `Token` (from `X-Vault-Token`), `Namespace` (from `X-Vault-Namespace`), `TLS` (`*tls.ConnectionState`), and `RemoteAddr`. If no authorizer is configured, `NewServer` returns an error unless `transhim.AllowUnauthenticated()` is passed explicitly.
 
 The authorizer returns an error wrapping `ErrPermissionDenied` to answer 403. Any other error also rejects the request and is mapped as in §6.8. `transhim.StaticTokenAuthorizer(token)` is provided for the common single-token setup (constant-time comparison; an empty token allows nothing).
 

@@ -183,7 +183,7 @@ func TestOpenBaoTransitSeal(t *testing.T) {
 	if st.Type != "transit" || st.Initialized || !st.Sealed {
 		t.Fatalf("status of a new server = %+v, want an uninitialized, sealed transit seal", st)
 	}
-	evs, reqs := c.take()
+	_, reqs := c.take()
 	if len(reqs) == 0 || reqs[0] != "PUT /v1/auth/token/renew-self" {
 		t.Errorf("first request = %v, want the token renewal", reqs)
 	}
@@ -198,7 +198,7 @@ func TestOpenBaoTransitSeal(t *testing.T) {
 	// unseals itself.
 	b.init()
 	b.waitFor("unsealed after init", func(st sealStatus) bool { return st.Initialized && !st.Sealed })
-	evs, reqs = c.take()
+	evs, reqs := c.take()
 	t.Logf("init: %v", evs)
 	if !slices.Contains(evs, "encrypt 200") || slices.ContainsFunc(evs, func(e string) bool { return !strings.HasSuffix(e, " 200") }) {
 		t.Errorf("init caused %v, want successful encrypts", evs)

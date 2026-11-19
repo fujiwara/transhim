@@ -21,13 +21,15 @@ const (
 	OpGenerateDataKey = "generate_data_key"
 	OpCreateKey       = "create_key"
 	OpDeleteKey       = "delete_key"
+	OpDescribeKey     = "describe_key"
 )
 
 const fakeKeyRef = "fake"
 
 // FakeBackend is a transhim.Backend that keeps AES-256 keys in memory and
 // wraps with AES-GCM, binding the AAD. It also implements
-// transhim.KeyLifecycle. A key exists after AddKey or CreateKey.
+// transhim.KeyLifecycle and transhim.KeyDescriber. A key exists after AddKey
+// or CreateKey.
 //
 // It can inject errors and latency, and counts calls. It is safe for
 // concurrent use.
@@ -107,6 +109,17 @@ func (b *FakeBackend) DeleteKey(ctx context.Context, mountID, keyName string) er
 	}
 	b.RemoveKey(mountID, keyName)
 	return nil
+}
+
+// DescribeKey implements transhim.KeyDescriber. Every key has version 1.
+func (b *FakeBackend) DescribeKey(ctx context.Context, mountID, keyName string) (transhim.KeyInfo, error) {
+	if err := b.lifecycle(ctx, OpDescribeKey); err != nil {
+		return transhim.KeyInfo{}, err
+	}
+	if !b.HasKey(mountID, keyName) {
+		return transhim.KeyInfo{}, fmt.Errorf("%w: %s", transhim.ErrKeyNotFound, keyName)
+	}
+	return transhim.KeyInfo{Version: 1}, nil
 }
 
 func wait(ctx context.Context, d time.Duration) error {

@@ -131,7 +131,8 @@ These are OpenBao's answers, recorded for the golden fixtures. Where transhim de
 | `POST keys/{name}` with `exportable: true` | `200` | transhim rejects it |
 | `POST keys/{name}/config` | `200` with key metadata; `400` if the key is missing | transhim answers `204`, empty |
 | `DELETE keys/{name}` | `204`; `400` without `deletion_allowed`; `400` if the key is missing | transhim treats a missing key as success |
-| `GET keys/{name}` on a missing key | `404 {"errors":[]}` | |
+| `GET keys/{name}` | `200` with key metadata | transhim answers with the same fields for a key that is not derived; the two that describe a derivation (`kdf`, `convergent_encryption`) never appear |
+| `GET keys/{name}` on a missing key | `404 {"errors":[]}` | the same, if the backend can tell (`KeyDescriber`); otherwise every key is reported as existing |
 | `GET` on `datakey` | `405` | |
 | unknown operation / unknown mount | `404` | |
 | no token / wrong token | `403 {"errors":["permission denied"]}` | |
@@ -205,12 +206,49 @@ seal "transit" {
 ```
 
 - **What it calls.** `PUT {prefix}/encrypt/{name}` and `PUT {prefix}/decrypt/{name}`, without a context. It encrypts a one byte plaintext as a health check, at startup and around every unseal; at `operator init` it wraps the root key; at every start of an initialized server it decrypts it. No `datakey`, no `keys/` call.
-- **Token renewal is not needed.** At every start it sends `PUT /v1/auth/token/renew-self` once. transhim answers `404`, as it does for everything outside its mounts, and OpenBao goes on without a word in its log. (Against OpenBao the answer is `400 lease is not renewable` for a root token, which it takes the same way.) The token stubs planned in DESIGN.md §6.7 are not needed for this client.
+- **Token renewal is not needed.** At every start it sends `PUT /v1/auth/token/renew-self` once. transhim answers `404`, as it does for everything outside its mounts but the token lookup, and OpenBao goes on without a word in its log. (Against OpenBao the answer is `400 lease is not renewable` for a root token, which it takes the same way.) The token stubs planned in DESIGN.md §6.7 are not needed for this client.
 - **The key must exist** in the backend; nothing creates it.
 - **If the key cannot be used, the server stays sealed.** With `decrypt` failing (`503`), a restarted OpenBao tries three times, stays sealed, and unseals at the next restart once the key service is back.
 - It uses Vault's Go client, like sops: `PUT`, `X-Vault-Request: true`, three attempts on `502` and `503`.
 
 The seal key protects the whole server's root key. The mount ID and the key name are bound into the wrapped key, so neither may change while a server is sealed with it.
+
+### Kubernetes KMS plugin (vault-kubernetes-kms)
+
+[vault-kubernetes-kms](https://github.com/FalcoSuessgott/vault-kubernetes-kms), a KMS plugin that lets kube-apiserver encrypt Secrets with a Transit key, works against a transhim server built with `WithTokenLookup`. Observed with vault-kubernetes-kms 1.4.0 (`integration/`, `TestKubernetesKMSPlugin` and `TestKubernetesKMSPluginRefused`); what it sends to OpenBao 2.7.2 was recorded with `tools/vaultrec` and is the same.
+
+Only the plugin was run (`-auth-method token`, `-disable-v1`), driven over its socket with the KMS v2 calls kube-apiserver makes (`Status`, `Encrypt`, `Decrypt`). kube-apiserver itself was not.
+
+```console
+$ vault-kubernetes-kms -vault-address https://transhim.example.com:8200 \
+    -auth-method token -token ...  \
+    -transit-mount transit -transit-key my-key
+```
+
+`-transit-mount` is the mount's prefix without `/v1/`; the token is what the server's authorizer expects.
+
+What the plugin sends:
+
+| request | sent when |
+|---|---|
+| `GET /v1/auth/token/lookup-self` | at startup, and at every `-token-refresh-interval` (60 s by default) |
+| `GET {prefix}/keys/{name}` | twice per `Status`, once after the `encrypt` of every `Encrypt` and of every health check |
+| `PUT {prefix}/encrypt/{name}` with `{"plaintext":"..."}` | `Encrypt`; in `Status` and `/health` as a check, with the plaintext `health` |
+| `PUT {prefix}/decrypt/{name}` with `{"ciphertext":"..."}` | `Decrypt`; in `Status` and `/health`, on what the check encrypted |
+
+What that shows:
+
+- **The token lookup is mandatory.** Without an answer to `lookup-self` the plugin exits at startup (`Failed to create vault client`): with `404` from a server without `WithTokenLookup`, with `403` for a token the authorizer refuses.
+- **`lookup-self` also drives the token renewal.** The plugin reads `data.ttl` and `data.creation_ttl` and renews when less than half of the lifetime is left. transhim answers `0` for both, so it never does; `renew-self` is not served and not needed. An answer without `creation_ttl` makes the plugin log `failed to assert creation_ttl type` at every interval.
+- **`latest_version` becomes the KMS v2 `key_id`**, which Kubernetes stores with every Secret and watches for a rotation of the key. Nothing else of the key read is used. transhim reports `1` unless the backend implements `KeyDescriber` and says otherwise, so Kubernetes never sees a rotation: a backend that rotates on its own keeps old ciphertexts readable by itself.
+- **A missing key shows in the health status, not in the key read.** With a backend that cannot tell whether a key exists, the key read succeeds for any name; the check's `encrypt` then fails (`400 encryption key not found`), and `Status` reports an unhealthy plugin.
+- **Only token auth applies.** The plugin's other auth methods (AppRole, userpass, cert, JWT) log in under `auth/`, which transhim does not serve.
+- **No context**, no `datakey`: kube-apiserver makes its own data keys, and the plugin wraps them with `encrypt`.
+- **Every call costs more than one request.** An `Encrypt` is an `encrypt` and a key read; a `Status`, which kube-apiserver polls, is two key reads, an `encrypt`, and a `decrypt`. The key reads reach the backend only if it implements `KeyDescriber`.
+- It uses Vault's Go client, like sops: `PUT`, `X-Vault-Request: true`, no `Content-Type`.
+- The KMS v1 service of the plugin was not run. By the source (`pkg/plugin/plugin_v1.go`) it sends the same `encrypt`, key read, and `decrypt`, and has no `Status`.
+
+Before transhim served the two reads (up to v0.2.0), the plugin did not start: that is what `GET keys/{name}` and `WithTokenLookup` were added for.
 
 ### RustFS
 
@@ -222,9 +260,9 @@ What RustFS sends to OpenBao:
 
 | request | sent when | against transhim |
 |---|---|---|
-| `GET /v1/auth/token/lookup-self` | at startup | `404`. RustFS goes on without it (it then does not renew the token) |
+| `GET /v1/auth/token/lookup-self` | at startup | `404` (without `WithTokenLookup`). RustFS goes on without it (it then does not renew the token) |
 | `LIST {prefix}/keys` | at startup, as the health check, and again later | `404 unsupported path`. **RustFS does not start**: only a `404` without a message, as Vault gives for an empty mount, passes. Nothing below was reached |
-| `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | would be `404`, which RustFS takes as a missing key (`KMS.NotFoundException`) |
+| `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | was `404` when this was run, which RustFS takes as a missing key (`KMS.NotFoundException`). transhim serves the read since (see below) |
 | `GET` and `POST /v1/secret/data/rustfs/kms/transit-metadata/{name}` | with the first use of a key: RustFS keeps a record per key (state, usage, tags) in KV v2 and creates it with check-and-set | not Transit, and not served. The write is mandatory: by the source, a key is not used if it fails |
 | `POST {prefix}/keys/rustfs-internal-kms-probe` with `{"type":"aes256-gcm96"}` | at startup: a key of its own for the health probe | would be accepted |
 | `POST {prefix}/encrypt/{name}` with `{"plaintext":"...","associated_data":"..."}` | an encrypted object is written | `400 associated_data is not supported`; see below |
@@ -237,35 +275,7 @@ What that shows:
 - **It reads key metadata.** `GET keys/{name}` is deserialized into the full shape of Vault's answer (`type`, `keys`, `latest_version`, and so on), and the source has calls for `rotate`, `rewrap`, `config`, and `DELETE` as well, for its key management API.
 - **Requests** come from the Rust client `vaultrs`: `POST` and `LIST`, an `X-Vault-Request: true` header, no `Content-Type`.
 
-To serve RustFS, transhim would need `LIST keys`, `GET keys/{name}` in Vault's shape, and `associated_data` bound into ciphertexts, and the deployment would still need a real Vault or OpenBao for the KV v2 records, with a proxy sending the Transit paths to transhim. None of this exists.
-
-### Kubernetes KMS plugin (vault-kubernetes-kms)
-
-[vault-kubernetes-kms](https://github.com/FalcoSuessgott/vault-kubernetes-kms), a KMS plugin that lets kube-apiserver encrypt Secrets with a Transit key, **does not work against transhim**: it needs two reads that transhim does not serve. Observed with vault-kubernetes-kms 1.4.0.
-
-How it was looked at: the plugin alone (`-auth-method token`, `-disable-v1`), driven over its socket with the KMS v2 client of its repository (`cmd/v2_client`: `Status`, `Encrypt`, `Decrypt`) and through its `/health` endpoint; first with `tools/vaultrec` in front of OpenBao 2.7.2, then pointed at a transhim server, then at a transhim server with stubs for the two reads. kube-apiserver was not run.
-
-What the plugin sends to OpenBao:
-
-| request | sent when | against transhim |
-|---|---|---|
-| `GET /v1/auth/token/lookup-self` | at startup, and at every `-token-refresh-interval` (60 s by default) | `404`. **The plugin does not start** (`Failed to create vault client`) |
-| `GET {prefix}/keys/{name}` | twice per `Status`, once after the `encrypt` of every `Encrypt` and of every health check | `404 unsupported path`. `Status`, `Encrypt`, and `/health` fail with `could not read transit key` |
-| `PUT {prefix}/encrypt/{name}` with `{"plaintext":"..."}` | `Encrypt`; in `Status` and `/health` as a check, with the plaintext `health` | `200` |
-| `PUT {prefix}/decrypt/{name}` with `{"ciphertext":"..."}` | `Decrypt`; in `Status` and `/health`, on what the check encrypted | `200` |
-
-What that shows:
-
-- **Two reads are missing, nothing else.** With `lookup-self` answered by `{"data":{"ttl":0,"creation_ttl":0}}` and `GET keys/{name}` by `{"data":{"latest_version":1}}`, and everything else going to transhim, the plugin starts, `Status` reports `ok`, and `Encrypt` and `Decrypt` round-trip.
-- **`latest_version` becomes the KMS v2 `key_id`**, which Kubernetes stores with every Secret and watches for a rotation of the key. Nothing else of the key's metadata is read. transhim has no key versions to report (a backend rotates on its own, behind `vault:v1:`), so a served `latest_version` would be a constant.
-- **`lookup-self` drives the token renewal.** The plugin reads `data.ttl` and `data.creation_ttl` and renews when less than half of the lifetime is left; with both `0` it never does. The answer planned in DESIGN.md §6.7 has no `creation_ttl`: with it the plugin still works, but logs `failed to assert creation_ttl type` at every interval.
-- **Only token auth applies.** The plugin's other auth methods (AppRole, userpass, cert, JWT) log in under `auth/`, which transhim does not serve.
-- **No context**, no `datakey`: kube-apiserver makes its own data keys, and the plugin wraps them with `encrypt`.
-- **Every call costs more than one request.** An `Encrypt` is an `encrypt` and a key read; a `Status`, which kube-apiserver polls, is two key reads, an `encrypt`, and a `decrypt`. The `encrypt` is sent before the key read, so against transhim as it is, every failing `Encrypt` still reaches the backend once.
-- It uses Vault's Go client, like sops: `PUT`, `X-Vault-Request: true`, no `Content-Type`.
-- The KMS v1 service of the plugin was not run. By the source (`pkg/plugin/plugin_v1.go`) it sends the same `encrypt`, key read, and `decrypt`, and has no `Status`.
-
-To serve this plugin, transhim would need `GET keys/{name}` with a `latest_version` (DESIGN.md D7) and `auth/token/lookup-self` with `ttl` and `creation_ttl` (D6). Neither exists.
+RustFS was run before transhim served `GET keys/{name}`; it has not been run again, and the other gaps remain. To serve RustFS, transhim would need `LIST keys` and `associated_data` bound into ciphertexts, and the deployment would still need a real Vault or OpenBao for the KV v2 records, with a proxy sending the Transit paths to transhim. None of this exists.
 
 ## Not covered yet
 
