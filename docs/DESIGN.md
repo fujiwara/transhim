@@ -110,9 +110,9 @@ The `openbao` key provider uses `datakey/plaintext` and `decrypt`, and may read 
 
 Most of these use the go-kms-wrapping transit wrapper. That wrapper calls token `renew-self` once at startup and goes on if it fails (see §6.7 and compat.md). Verified so far: OpenBao's transit seal and SOPS, both working ([compat.md](compat.md)).
 
-### UC5. RustFS (verified: not supported)
+### UC5. RustFS (verified: works behind a wrapper)
 
-RustFS has a `vault-transit` KMS backend. Its request set was captured for RustFS 1.0.6 ([compat.md](compat.md)): it needs `LIST keys`, `GET keys/{name}` (not served then; see §6.5), `associated_data` on `encrypt` and `decrypt`, and, outside Transit, a KV v2 engine at the same address for its key records. It does not work against transhim, and cannot with transhim alone.
+RustFS has a `vault-transit` KMS backend. Its request set was captured for RustFS 1.0.6 ([compat.md](compat.md)): it needs `LIST keys`, `GET keys/{name}`, `associated_data` on `encrypt` and `decrypt`, and, outside Transit, a KV v2 engine at the same address for its key records. transhim serves the key read; the rest is left to a wrapper in front of the server, which compat.md describes. `associated_data` is not bound by transhim itself: RustFS is the only client seen to send it, and binding it would add to the AAD format for good (§6.2).
 
 ### UC6. Kubernetes KMS plugin (verified: works)
 
@@ -482,7 +482,7 @@ Status: items 1, 2, 4, and 6 are **done** (M0) for Ceph 19.2.7, 20.2.5, and 21.2
 2. Confirm which `rgw_crypt_vault_secret_engine` compat value disables the legacy export path.
 3. Confirm the behavior of the go-kms-wrapping transit wrapper with `renewable: false` from `lookup-self`. **Done** with OpenBao 2.7.2's transit seal (compat.md): it does not call `lookup-self`, and a failing `renew-self` does not stop it.
 4. Confirm whether any client parses the `vault:vN:` version, or validates the ciphertext format beyond treating it as opaque.
-5. Capture the RustFS `vault-transit` request set before claiming UC5. **Done** for RustFS 1.0.6 (compat.md): not supported.
+5. Capture the RustFS `vault-transit` request set before claiming UC5. **Done** for RustFS 1.0.6 (compat.md): works behind a wrapper, not with transhim alone.
 6. Confirm Vault's exact error status and message for "key not found" on decrypt and datakey.
 
 Generate golden fixtures (request and response pairs) from a real Vault or OpenBao, and use them in `transhimtest` for API-shape conformance tests.

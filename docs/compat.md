@@ -252,30 +252,43 @@ Before transhim served the two reads (up to v0.2.0), the plugin did not start: t
 
 ### RustFS
 
-[RustFS](https://github.com/rustfs/rustfs) with its `vault-transit` KMS backend **does not work against transhim**, and cannot with transhim alone: it needs a KV v2 secrets engine at the same address. Observed with RustFS 1.0.6 (§12 item 5).
+[RustFS](https://github.com/rustfs/rustfs) with its `vault-transit` KMS backend does not work against transhim alone, and **does with a small wrapper in front of it** that adds three things: an answer to `LIST keys`, a translation of `associated_data`, and a KV v2 secrets engine. Observed with RustFS 1.0.6 (§12 item 5).
 
-How it was looked at: RustFS in a container (`RUSTFS_KMS_ENABLE=true`, `RUSTFS_KMS_BACKEND=vault-transit`, `RUSTFS_KMS_VAULT_ADDRESS`, `RUSTFS_KMS_VAULT_TOKEN`; the Transit mount defaults to `transit`), first with `tools/vaultrec` in front of OpenBao 2.7.2, then pointed at a transhim server. Source references are to `crates/kms/src/backends/vault_transit.rs` at the tag `1.0.6`.
+How it was looked at: RustFS in a container (`RUSTFS_KMS_ENABLE=true`, `RUSTFS_KMS_BACKEND=vault-transit`, `RUSTFS_KMS_VAULT_ADDRESS`, `RUSTFS_KMS_VAULT_TOKEN`; the Transit mount defaults to `transit`), first with `tools/vaultrec` in front of OpenBao 2.7.2, then pointed at a transhim server (v0.2.0), then at a throwaway wrapper around a transhim server that has `GET keys/{name}` and `WithTokenLookup`. Nothing of this is in the repository or in CI. Source references are to `crates/kms/src/backends/vault_transit.rs` at the tag `1.0.6`.
 
 What RustFS sends to OpenBao:
 
 | request | sent when | against transhim |
 |---|---|---|
-| `GET /v1/auth/token/lookup-self` | at startup | `404` (without `WithTokenLookup`). RustFS goes on without it (it then does not renew the token) |
-| `LIST {prefix}/keys` | at startup, as the health check, and again later | `404 unsupported path`. **RustFS does not start**: only a `404` without a message, as Vault gives for an empty mount, passes. Nothing below was reached |
-| `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | was `404` when this was run, which RustFS takes as a missing key (`KMS.NotFoundException`). transhim serves the read since (see below) |
+| `GET /v1/auth/token/lookup-self` | at startup | served with `WithTokenLookup`. Without it `404`, and RustFS goes on (it then does not renew the token) |
+| `LIST {prefix}/keys` | at startup, as the health check, and again later | `404 unsupported path`. **RustFS does not start**: only a `404` without a message, as Vault gives for an empty mount, passes |
+| `GET {prefix}/keys/{name}` | before a key is used for the first time, and again later | served, and accepted as it is. A `404` without a message is taken as a missing key (`KMS.NotFoundException`) |
 | `GET` and `POST /v1/secret/data/rustfs/kms/transit-metadata/{name}` | with the first use of a key: RustFS keeps a record per key (state, usage, tags) in KV v2 and creates it with check-and-set | not Transit, and not served. The write is mandatory: by the source, a key is not used if it fails |
-| `POST {prefix}/keys/rustfs-internal-kms-probe` with `{"type":"aes256-gcm96"}` | at startup: a key of its own for the health probe | would be accepted |
+| `POST {prefix}/keys/rustfs-internal-kms-probe` with `{"type":"aes256-gcm96"}` | at startup, if the key is not there: a key of its own for the health probe | accepted, with the empty `204` |
 | `POST {prefix}/encrypt/{name}` with `{"plaintext":"...","associated_data":"..."}` | an encrypted object is written | `400 associated_data is not supported`; see below |
 | `POST {prefix}/decrypt/{name}` with `{"ciphertext":"...","associated_data":"..."}` | an encrypted object is read | the same |
 
 What that shows:
 
 - **No `datakey`.** RustFS makes the data key itself and wraps it with `encrypt`, as sops does. Keys are not created on demand: an S3 request naming a key that Transit does not have fails with `KMS.NotFoundException`. SSE-S3 uses the default key, named `default` unless `RUSTFS_KMS_DEFAULT_KEY_ID` is set.
-- **The object is bound with `associated_data`, not `context`.** Its value is the base64 of a JSON object: `{"<bucket>":"<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries. transhim binds `context` only and refuses a request with `associated_data` (`400`), rather than accept it and drop the binding without anyone noticing.
+- **The object is bound with `associated_data`, not `context`.** Its value is the base64 of a JSON object: `{"<bucket>":"<bucket>/<object>"}`, plus the client's `x-amz-server-side-encryption-context` entries. No `context` is sent along. transhim binds `context` only and refuses a request with `associated_data` (`400`), rather than accept it and drop the binding without anyone noticing.
 - **It reads key metadata.** `GET keys/{name}` is deserialized into the full shape of Vault's answer (`type`, `keys`, `latest_version`, and so on), and the source has calls for `rotate`, `rewrap`, `config`, and `DELETE` as well, for its key management API.
 - **Requests** come from the Rust client `vaultrs`: `POST` and `LIST`, an `X-Vault-Request: true` header, no `Content-Type`.
 
-RustFS was run before transhim served `GET keys/{name}`; it has not been run again, and the other gaps remain. To serve RustFS, transhim would need `LIST keys` and `associated_data` bound into ciphertexts, and the deployment would still need a real Vault or OpenBao for the KV v2 records, with a proxy sending the Transit paths to transhim. None of this exists.
+#### What a wrapper has to add
+
+A server for RustFS is a transhim server (with `WithTokenLookup`, though RustFS starts without it) behind an `http.Handler` of your own that handles three kinds of requests and passes on the rest. With these, RustFS started, and SSE-S3 and SSE-KMS objects (also with an encryption context, and copied) were written, read back, and read again after a restart of RustFS; a key that does not exist was reported as such.
+
+1. **`LIST {prefix}/keys`**: answer `404` with `{"errors":[]}`. That is Vault's answer for a mount without keys, and enough for the health check. RustFS's own key listing then shows nothing; to list keys for real, the wrapper needs a source of key names, which a transhim backend does not offer.
+2. **`associated_data` in `encrypt` and `decrypt`**: move the value into `context` (both are base64) and drop `associated_data`. transhim then binds it as it binds any context, and the authorizer and the audit hook see it as the context. This makes a context and an associated data of the same value interchangeable, which is harmless as long as RustFS, which sends no context, is the only client of the mount.
+3. **KV v2 below `/v1/secret/data/rustfs/kms/transit-metadata/`**: either pass these requests on to a real Vault or OpenBao (that is what was run), or serve them yourself. What RustFS was seen to send:
+   - `GET .../{name}`: for a record that does not exist, `404` with `{"errors":[]}`; for one that does, KV v2's answer, `{"data":{"data":{...},"metadata":{"version":1,...}}}`.
+   - `POST .../{name}` with `{"data":{...},"options":{"cas":0}}`: create the record unless it exists (`cas: 0`), and answer with `{"data":{"version":1,...}}`. The record must survive restarts: it is where RustFS keeps the state of a key.
+   - Updates and deletes of a record, which RustFS's key management API would cause, were not exercised.
+
+The keys must exist in the backend, as with every client but RGW's SSE-S3: `default`, the ones S3 clients name, and `rustfs-internal-kms-probe`, which RustFS asks to be created at startup (a backend with `KeyLifecycle`, such as the hierarchical backend, creates it then; with pre-provisioned keys, provision it). A backend that implements `KeyDescriber` lets RustFS tell a missing key from a present one before it uses it.
+
+Not looked at: RustFS's key management API (create, list, rotate, delete), and how it behaves when the key service fails.
 
 ## Not covered yet
 
