@@ -1,5 +1,17 @@
 # Changelog
 
+## [v0.3.0](https://github.com/fujiwara/transhim/compare/v0.2.0...v0.3.0) - 2026-11-19
+
+- Require transhim v0.2.0 in the examples by @fujiwara in https://github.com/fujiwara/transhim/pull/15
+- Add hierarchical.ReadOnly for servers that must not write to the KeyStore by @fujiwara in https://github.com/fujiwara/transhim/pull/17
+- Run the tests for pull requests and for main only by @fujiwara in https://github.com/fujiwara/transhim/pull/19
+- Test sops as a second Transit client by @fujiwara in https://github.com/fujiwara/transhim/pull/18
+- Record what RustFS needs from a Transit endpoint by @fujiwara in https://github.com/fujiwara/transhim/pull/20
+- Refuse associated_data instead of ignoring it by @fujiwara in https://github.com/fujiwara/transhim/pull/21
+- Test OpenBao's transit seal as a Transit client by @fujiwara in https://github.com/fujiwara/transhim/pull/22
+- Serve key reads and the token lookup for a Kubernetes KMS plugin by @fujiwara in https://github.com/fujiwara/transhim/pull/23
+- Record that RustFS works behind a wrapper, and what the wrapper adds by @fujiwara in https://github.com/fujiwara/transhim/pull/24
+
 ## [v0.2.0](https://github.com/fujiwara/transhim/compare/v0.1.0...v0.2.0) - 2026-11-18
 
 - Require transhim v0.1.0 in the example modules by @fujiwara in https://github.com/fujiwara/transhim/pull/6
