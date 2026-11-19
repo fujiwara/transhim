@@ -867,6 +867,50 @@ func TestBodyReadTimeout(t *testing.T) {
 	}
 }
 
+// TestRefusedBeforeBodyIsRead: a request that is refused before its body is
+// looked at is answered at once, even if the body it announced never comes,
+// and gives up its connection instead of having the body read.
+func TestRefusedBeforeBodyIsRead(t *testing.T) {
+	// a long limit: the answers below must not wait for it
+	e := newEnv(t, transhim.WithTokenLookup(), transhim.WithBodyReadTimeout(time.Minute))
+	srv := httptest.NewServer(e.handler)
+	t.Cleanup(srv.Close)
+
+	for _, tt := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodPost, "/v1/elsewhere/datakey/plaintext/key1", 404}, // no such mount
+		{http.MethodPost, "/v1/transit-kms/rewrap/key1", 404},          // no such operation
+		{http.MethodDelete, "/v1/transit-kms/decrypt/key1", 405},
+		{http.MethodPost, "/v1/transit-kms/decrypt/a%2Fb", 400}, // invalid key name
+		{http.MethodPost, "/v1/auth/token/lookup-self", 405},
+	} {
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: x\r\nX-Vault-Token: %s\r\nContent-Length: 100\r\n\r\n{", tt.method, tt.path, testToken)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Errorf("%s %s: no answer to a request whose body never comes: %v", tt.method, tt.path, err)
+		} else if res.StatusCode != tt.want || !res.Close {
+			t.Errorf("%s %s: got %d, close %v; want %d and a closed connection", tt.method, tt.path, res.StatusCode, res.Close, tt.want)
+		}
+		conn.Close()
+	}
+
+	// Without a body there is nothing to wait for, and the connection stays.
+	if r := e.do(http.MethodGet, "/v1/elsewhere/x", ""); r.status != 404 || r.header.Get("Connection") != "" {
+		t.Errorf("refused request without a body: got %d, Connection %q; want 404 and no Connection header", r.status, r.header.Get("Connection"))
+	}
+	// A request that got as far as its body keeps the connection as well.
+	if r := e.do(http.MethodPost, "/v1/transit-kms/encrypt/nokey", `{"plaintext":"YQ=="}`); r.status != 400 || r.header.Get("Connection") != "" {
+		t.Errorf("request refused after its body was read: got %d, Connection %q; want 400 and no Connection header", r.status, r.header.Get("Connection"))
+	}
+}
+
 // The time limit for the body does not apply to what follows: a backend call
 // that takes longer is not cut off.
 func TestBodyReadTimeoutEndsWithBody(t *testing.T) {

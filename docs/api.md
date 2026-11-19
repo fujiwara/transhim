@@ -52,6 +52,8 @@ There are no Vault tokens, policies, or leases. The token is whatever the server
 5. The body cannot be used: `413 request body too large`, `408 request body not received in time`, `400 failed to decode JSON input`, `400 failed to base64-decode context`.
 6. The operation itself.
 
+A request that is refused in steps 1 to 3 is answered without its body being read. If it has one, the answer carries `Connection: close`.
+
 ### Answers
 
 Successful answers with data are `200` and have Vault's shape. Only `data` carries anything:

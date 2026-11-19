@@ -284,6 +284,8 @@ type request struct {
 	mount    *mount
 	keyName  string
 	cacheHit bool
+	// bodyRead says that the request body was read, or given up reading.
+	bodyRead bool
 }
 
 func (req *request) keyID() keyID { return keyID{req.mount.id, req.keyName} }
@@ -308,6 +310,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var status int
 	switch {
 	case err != nil:
+		if !req.bodyRead && r.ContentLength != 0 {
+			// The request was refused before its body was looked at (no
+			// such route, wrong method, invalid key name). net/http would
+			// now read the body to keep the connection, before it sends the
+			// answer and with no time limit: a client that announced a body
+			// and withholds it would get no answer and hold the connection.
+			// Giving the connection up makes it skip that.
+			w.Header().Set("Connection", "close")
+		}
 		status = s.writeError(w, r, req, err)
 	case res.data == nil:
 		status = http.StatusNoContent
@@ -374,6 +385,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, req *request) (*r
 	// authorizer is told the context. A body that cannot be used is reported
 	// only after that: a client that is not allowed in gets a 403 whatever it
 	// sent.
+	req.bodyRead = true
 	body, bodyErr := s.readBody(w, r)
 	if bodyErr == nil {
 		req.context, bodyErr = requestContext(op, body)
@@ -445,6 +457,7 @@ func (s *Server) handleTokenLookup(w http.ResponseWriter, r *http.Request, req *
 	// within the same limits as everywhere else: left alone, net/http would
 	// wait for it without any, after the answer. As everywhere else, what is
 	// wrong with it is reported only to a client that is allowed in.
+	req.bodyRead = true
 	_, bodyErr := s.readBody(w, r)
 	if err := s.authorize(r, req); err != nil {
 		return nil, err
